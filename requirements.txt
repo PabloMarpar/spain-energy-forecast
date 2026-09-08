@@ -1,0 +1,12 @@
+requests
+pandas
+numpy
+matplotlib
+holidays
+statsmodels
+pmdarima
+xgboost
+optuna
+chronos-forecasting
+streamlit
+plotly

@@ -1,0 +1,136 @@
+{
+  "demanda_mwh": {
+    "Baseline": {
+      "MAE": 3386.07,
+      "RMSE": 3964.375,
+      "MAPE_%": 10.96,
+      "sMAPE_%": 11.82,
+      "R2": -0.063,
+      "Bias": 3302.064,
+      "MAPE_dia1_%": 3.52,
+      "MAPE_dia7_%": 16.31
+    },
+    "SARIMAX": {
+      "MAE": 1843.638,
+      "RMSE": 2338.204,
+      "MAPE_%": 6.14,
+      "sMAPE_%": 6.43,
+      "R2": 0.63,
+      "Bias": 1556.852,
+      "MAPE_dia1_%": 3.12,
+      "MAPE_dia7_%": 4.88,
+      "orden": "(2, 0, 2)x(1, 0, 1, 24)",
+      "orden_pdq": [
+        2,
+        0,
+        2
+      ],
+      "orden_estacional": [
+        1,
+        0,
+        1,
+        24
+      ],
+      "mejora_vs_baseline_%": 44.0
+    },
+    "XGBoost": {
+      "MAE": 2452.143,
+      "RMSE": 2678.306,
+      "MAPE_%": 7.91,
+      "sMAPE_%": 8.29,
+      "R2": 0.515,
+      "Bias": 2452.143,
+      "MAPE_dia1_%": 5.84,
+      "MAPE_dia7_%": 10.99,
+      "mejores_hiperparametros": {
+        "n_estimators": 525,
+        "max_depth": 7,
+        "learning_rate": 0.05080035703182098,
+        "subsample": 0.7706489120613069,
+        "colsample_bytree": 0.7778267770902159,
+        "min_child_weight": 8,
+        "reg_lambda": 2.384788214563802
+      },
+      "mejora_vs_baseline_%": 27.8
+    },
+    "Chronos-2": {
+      "MAE": 2772.188,
+      "RMSE": 3105.129,
+      "MAPE_%": 8.86,
+      "sMAPE_%": 9.36,
+      "R2": 0.348,
+      "Bias": 2772.188,
+      "MAPE_dia1_%": 3.42,
+      "MAPE_dia7_%": 11.98,
+      "mejora_vs_baseline_%": 19.2
+    },
+    "_campeon": "SARIMAX"
+  },
+  "renewable_pct": {
+    "Baseline": {
+      "MAE": 5.966,
+      "RMSE": 7.922,
+      "MAPE_%": 28.83,
+      "sMAPE_%": 23.04,
+      "R2": -0.315,
+      "Bias": -2.597,
+      "MAPE_dia1_%": 4.36,
+      "MAPE_dia7_%": 114.44
+    },
+    "SARIMAX": {
+      "MAE": 7.552,
+      "RMSE": 8.934,
+      "MAPE_%": 35.88,
+      "sMAPE_%": 28.17,
+      "R2": -0.673,
+      "Bias": -4.482,
+      "MAPE_dia1_%": 5.39,
+      "MAPE_dia7_%": 123.64,
+      "orden": "(2, 0, 1)x(0, 0, 0, 7)",
+      "orden_pdq": [
+        2,
+        0,
+        1
+      ],
+      "orden_estacional": [
+        0,
+        0,
+        0,
+        7
+      ],
+      "mejora_vs_baseline_%": -24.5
+    },
+    "XGBoost": {
+      "MAE": 5.276,
+      "RMSE": 7.34,
+      "MAPE_%": 25.08,
+      "sMAPE_%": 19.22,
+      "R2": -0.129,
+      "Bias": -5.276,
+      "MAPE_dia1_%": 6.57,
+      "MAPE_dia7_%": 102.64,
+      "mejores_hiperparametros": {
+        "n_estimators": 496,
+        "max_depth": 4,
+        "learning_rate": 0.02686069415245766,
+        "subsample": 0.8921071764910875,
+        "colsample_bytree": 0.9678959305350419,
+        "min_child_weight": 6,
+        "reg_lambda": 0.1775481374477821
+      },
+      "mejora_vs_baseline_%": 13.0
+    },
+    "Chronos-2": {
+      "MAE": 4.086,
+      "RMSE": 5.876,
+      "MAPE_%": 21.55,
+      "sMAPE_%": 16.45,
+      "R2": 0.276,
+      "Bias": -4.086,
+      "MAPE_dia1_%": 1.77,
+      "MAPE_dia7_%": 99.0,
+      "mejora_vs_baseline_%": 25.3
+    },
+    "_campeon": "Chronos-2"
+  }
+}
