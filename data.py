@@ -32,6 +32,17 @@ LAT, LON = 40.4168, -3.7038
 # España, para la variable exploratoria de oleaje ("fuerza del mar")
 MARINE_LAT, MARINE_LON = 43.30, -2.38
 
+# Madrid no es zona eólica -- los parques de verdad están concentrados en el valle
+# del Ebro (Aragón, viento de cierzo), la meseta norte (Castilla y León) y Galicia.
+# Medir el viento en Madrid para explicar generación eólica nacional es medir en el
+# sitio equivocado. Se añaden estos 3 puntos, representativos de las regiones con
+# más potencia eólica instalada de España, como variable específica para eso.
+WIND_REGIONS = {
+    "aragon": (41.65, -0.88),
+    "castilla_leon": (42.34, -3.70),
+    "galicia": (43.36, -8.41),
+}
+
 RENEWABLE_KEYWORDS = ["solar", "eólic", "eolic", "hidrául", "hidraul", "hidroeólica", "renovable", "geotérmica"]
 
 # Nombre de tecnología (tal cual lo da REE) -> columna corta, para poder guardar el
@@ -206,7 +217,12 @@ def fetch_ree_generacion(start: date, end: date) -> pd.DataFrame:
 
 def _fetch_open_meteo(url: str, lat: float, lon: float, hourly_vars: str,
                        start: date = None, end: date = None, forecast_days: int = None) -> pd.DataFrame:
-    params = {"latitude": lat, "longitude": lon, "hourly": hourly_vars, "timezone": "Europe/Madrid"}
+    # Open-Meteo devuelve el viento en km/h por defecto, no en m/s -- se pide
+    # explícitamente m/s para que `wind_power_proxy` (potencia ~ velocidad^3,
+    # con el corte físico pensado en m/s) tenga sentido, y para que cualquiera
+    # que lea el dataset no tenga que adivinar la unidad.
+    params = {"latitude": lat, "longitude": lon, "hourly": hourly_vars, "timezone": "Europe/Madrid",
+              "wind_speed_unit": "ms"}
     if forecast_days is not None:
         params["forecast_days"] = forecast_days
     else:
@@ -255,6 +271,38 @@ def fetch_weather(start: date = None, end: date = None, forecast_days: int = Non
 def fetch_marine(start: date = None, end: date = None, forecast_days: int = None) -> pd.DataFrame:
     return _fetch_open_meteo(MARINE_URL, MARINE_LAT, MARINE_LON, "wave_height,swell_wave_height",
                               start, end, forecast_days)
+
+
+def fetch_wind_regions(start: date = None, end: date = None, forecast_days: int = None) -> pd.DataFrame:
+    """Viento en las 3 regiones con más potencia eólica instalada de España (no en
+    Madrid, que no es zona eólica) -- da una media (cuánto viento hay "en general")
+    y un máximo (si al menos una región está soplando fuerte, aunque las otras no)
+    entre las tres, más una variable física: la potencia de un aerogenerador escala
+    aprox. con el cubo de la velocidad del viento (hasta el punto en que ya genera a
+    potencia nominal), así que `v_media^3` (recortado a 12 m/s, la zona típica antes
+    de saturar) es una variable mucho más cercana a "cuánta energía se puede sacar"
+    que la velocidad en bruto -- un árbol de decisión puede aproximar esa curva a
+    base de cortes, pero dársela ya calculada le ahorra tener que reconstruirla.
+    """
+    url = METEO_FORECAST_URL if forecast_days else METEO_ARCHIVE_URL
+    per_region = []
+    for name, (lat, lon) in WIND_REGIONS.items():
+        region_df = _fetch_open_meteo(url, lat, lon, "wind_speed_10m,wind_speed_100m",
+                                       start, end, forecast_days)
+        region_df = region_df.rename(columns={"wind_speed_10m": f"wind10_{name}",
+                                                "wind_speed_100m": f"wind100_{name}"})
+        per_region.append(region_df.set_index("datetime"))
+        time.sleep(0.5)
+    merged = pd.concat(per_region, axis=1, join="inner")
+    wind100_cols = [f"wind100_{name}" for name in WIND_REGIONS]
+    wind10_cols = [f"wind10_{name}" for name in WIND_REGIONS]
+    out = pd.DataFrame(index=merged.index)
+    out["wind_national_mean_100m"] = merged[wind100_cols].mean(axis=1)
+    out["wind_national_max_100m"] = merged[wind100_cols].max(axis=1)
+    out["wind_national_std_100m"] = merged[wind100_cols].std(axis=1)
+    out["wind_national_mean_10m"] = merged[wind10_cols].mean(axis=1)
+    out["wind_power_proxy"] = out["wind_national_mean_100m"].clip(upper=12) ** 3
+    return out.reset_index()
 
 
 def add_calendar_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -312,7 +360,10 @@ def build_dataset(start: date, end: date, forecast_days: int = None) -> pd.DataF
     print("Descargando oleaje (Open-Meteo Marine)...")
     marine = fetch_marine(start, end, forecast_days)
 
-    df = weather.merge(marine, on="datetime", how="left")
+    print("Descargando viento en las 3 regiones eólicas (Aragón, Castilla y León, Galicia)...")
+    wind_regions = fetch_wind_regions(start, end, forecast_days)
+
+    df = weather.merge(marine, on="datetime", how="left").merge(wind_regions, on="datetime", how="left")
     if not demanda.empty:
         df = df.merge(demanda, on="datetime", how="left")
     if not generacion.empty:

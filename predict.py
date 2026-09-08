@@ -25,10 +25,13 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from data import CACHE_PATH, add_calendar_features, fetch_weather, fetch_marine, trim_incomplete_trailing_days
+from data import (
+    CACHE_PATH, add_calendar_features, fetch_weather, fetch_marine, fetch_wind_regions,
+    trim_incomplete_trailing_days,
+)
 from train import (
     OUTPUT_DIR, sarimax_auto_forecast, xgb_direct_forecast,
-    chronos_covariate_forecast, baseline_seasonal,
+    chronos_covariate_forecast, baseline_seasonal, SUB_RENEWABLE_TARGETS,
 )
 
 DEMAND_FEATURES = ["temperature_2m", "relative_humidity_2m", "shortwave_radiation",
@@ -40,7 +43,9 @@ DEMAND_SARIMAX_DEFAULTS = (24, 24 * 120)  # (periodo estacional, ventana de entr
 
 RENEWABLE_FEATURES = ["shortwave_radiation", "shortwave_radiation_max", "direct_radiation",
                        "cloud_cover", "wind_speed_10m", "wind_speed_10m_max",
-                       "wind_speed_100m", "wind_speed_100m_max", "precipitation",
+                       "wind_speed_100m", "wind_speed_100m_max",
+                       "wind_national_mean_100m", "wind_national_max_100m", "wind_national_std_100m",
+                       "wind_power_proxy", "wind_power_proxy_max", "precipitation",
                        "surface_pressure", "wave_height", "doy_sin", "doy_cos",
                        "is_weekend", "is_holiday"]
 RENEWABLE_SARIMAX_DEFAULTS = (7, None)
@@ -73,7 +78,8 @@ def load_history() -> pd.DataFrame:
 def fetch_future_weather(horizon_days: int = 7) -> pd.DataFrame:
     weather = fetch_weather(forecast_days=horizon_days)
     marine = fetch_marine(forecast_days=horizon_days)
-    future = weather.merge(marine, on="datetime", how="left")
+    wind_regions = fetch_wind_regions(forecast_days=horizon_days)
+    future = weather.merge(marine, on="datetime", how="left").merge(wind_regions, on="datetime", how="left")
     future = add_calendar_features(future)
     future["hour_sin"] = np.sin(2 * np.pi * future["hour"] / 24)
     future["hour_cos"] = np.cos(2 * np.pi * future["hour"] / 24)
@@ -119,7 +125,7 @@ def _forecast_target(target_col: str, combined: pd.DataFrame, horizon: int, lag_
     if champion == "Ensemble":
         sub_names = target_results["Ensemble"].get("compuesto_por", ["SARIMAX", "XGBoost", "Chronos-2"])
 
-    preds = []
+    preds, used = [], []
     for sub in sub_names:
         if progress:
             progress(f"Prediciendo {label} con {sub}" + (" (parte del ensemble)..." if champion == "Ensemble" else "..."))
@@ -127,19 +133,22 @@ def _forecast_target(target_col: str, combined: pd.DataFrame, horizon: int, lag_
             preds.append(_forecast_one_model(sub, combined, target_col, horizon, lag_steps, roll_windows,
                                               feature_cols, train_series_full, train_feat, fut_feat,
                                               target_results, chronos_pipeline, sarimax_defaults))
+            used.append(sub)
         except Exception as exc:
             print(f"{sub} falló en predicción en vivo ({exc}), se omite.")
     if not preds:
         full = pd.concat([train_series_full, pd.Series(np.nan, index=pd.DatetimeIndex(fut_feat["datetime"]))])
-        return baseline_seasonal(full, horizon, baseline_season_len)
+        return baseline_seasonal(full, horizon, baseline_season_len), "Baseline (fallback, todo lo demás falló)"
     if len(preds) == 1:
-        return preds[0]
+        return preds[0], used[0]
     ref_index = preds[0].index
-    return pd.Series(np.mean([np.asarray(p.reindex(ref_index)) for p in preds], axis=0), index=ref_index)
+    combined_pred = pd.Series(np.mean([np.asarray(p.reindex(ref_index)) for p in preds], axis=0), index=ref_index)
+    label_used = "Ensemble" if used == sub_names else f"Ensemble parcial ({'+'.join(used)})"
+    return combined_pred, label_used
 
 
 def forecast_demand(history: pd.DataFrame, future_weather: pd.DataFrame, target_results: dict,
-                     chronos_pipeline, progress=None) -> pd.Series:
+                     chronos_pipeline, progress=None) -> tuple:
     horizon = len(future_weather)
     future_part = future_weather[["datetime"] + DEMAND_FEATURES].copy()
     future_part["demanda_mwh"] = np.nan
@@ -155,7 +164,7 @@ def forecast_demand(history: pd.DataFrame, future_weather: pd.DataFrame, target_
 
 
 def forecast_renewable(history_daily: pd.DataFrame, future_daily: pd.DataFrame, target_results: dict,
-                        chronos_pipeline, progress=None) -> pd.Series:
+                        chronos_pipeline, progress=None) -> tuple:
     horizon = len(future_daily)
     future_part = future_daily[["datetime"] + RENEWABLE_FEATURES].copy()
     future_part["renewable_pct"] = np.nan
@@ -183,6 +192,11 @@ def aggregate_daily(hourly_future: pd.DataFrame) -> pd.DataFrame:
              wind_speed_10m_max=("wind_speed_10m", "max"),
              wind_speed_100m=("wind_speed_100m", "mean"),
              wind_speed_100m_max=("wind_speed_100m", "max"),
+             wind_national_mean_100m=("wind_national_mean_100m", "mean"),
+             wind_national_max_100m=("wind_national_max_100m", "max"),
+             wind_national_std_100m=("wind_national_std_100m", "mean"),
+             wind_power_proxy=("wind_power_proxy", "mean"),
+             wind_power_proxy_max=("wind_power_proxy", "max"),
              precipitation=("precipitation", "sum"),
              surface_pressure=("surface_pressure", "mean"),
              wave_height=("wave_height", "mean"),
@@ -196,11 +210,47 @@ def aggregate_daily(hourly_future: pd.DataFrame) -> pd.DataFrame:
     return daily
 
 
+TECH_COLS = ["renewable_pct", "tech_solar_fv_pct", "tech_solar_termica_pct", "tech_eolica_pct",
+             "tech_hidraulica_pct", "tech_otras_renovables_pct", "tech_residuos_renovables_pct"]
+
+
 def aggregate_daily_history(history: pd.DataFrame) -> pd.DataFrame:
     daily = aggregate_daily(history)
-    renewable = history.groupby(history["datetime"].dt.date)["renewable_pct"].first()
-    daily["renewable_pct"] = daily["datetime"].dt.date.map(renewable)
+    first_by_day = history.groupby(history["datetime"].dt.date)[TECH_COLS].first()
+    for col in TECH_COLS:
+        daily[col] = daily["datetime"].dt.date.map(first_by_day[col])
+    daily["solar_pct"] = daily["tech_solar_fv_pct"] + daily["tech_solar_termica_pct"]
+    daily["eolica_pct"] = daily["tech_eolica_pct"]
+    daily["hidraulica_pct"] = daily["tech_hidraulica_pct"]
+    daily["otras_pct"] = daily["tech_otras_renovables_pct"] + daily["tech_residuos_renovables_pct"]
     return daily
+
+
+def forecast_technology_breakdown(history_daily: pd.DataFrame, future_daily: pd.DataFrame,
+                                   renewable_results: dict, progress=None) -> dict:
+    """Predicción por tecnología (solar/eólica/hidráulica/otras) para mostrar el
+    desglose en la app, independientemente de qué modelo sea el campeón oficial
+    del % renovable agregado -- ver el reparto por fuente es útil aunque el
+    modelo campeón sea el que predice el total de una vez."""
+    sub_info = renewable_results.get("XGBoost (descompuesto)", {}).get("sub_modelos", {})
+    horizon = len(future_daily)
+    lag_steps = [1, 7, 14, 30, 365] if len(history_daily) > 400 else [1, 7, 14]
+    roll_windows = [7, 30] if len(history_daily) > 400 else [7]
+
+    breakdown = {}
+    for sub_target in SUB_RENEWABLE_TARGETS:
+        if progress:
+            progress(f"Prediciendo desglose por tecnología: {sub_target}...")
+        future_part = future_daily[["datetime"] + RENEWABLE_FEATURES].copy()
+        future_part[sub_target] = np.nan
+        combined = pd.concat(
+            [history_daily[["datetime", sub_target] + RENEWABLE_FEATURES], future_part], ignore_index=True
+        )
+        fixed_params = sub_info.get(sub_target, {}).get("mejores_hiperparametros")
+        pred, *_ = xgb_direct_forecast(combined, sub_target, horizon, lag_steps, roll_windows,
+                                        RENEWABLE_FEATURES, origin_stride=1, fixed_params=fixed_params)
+        breakdown[sub_target] = pred
+    return breakdown
 
 
 def build_forecast(progress=None) -> dict:
@@ -233,11 +283,23 @@ def build_forecast(progress=None) -> dict:
         from chronos import Chronos2Pipeline
         chronos_pipeline = Chronos2Pipeline.from_pretrained("amazon/chronos-2", device_map="cpu")
 
-    demand_pred = forecast_demand(history, future_hourly, demand_results, chronos_pipeline, _p)
+    demand_pred, demand_model_used = forecast_demand(history, future_hourly, demand_results, chronos_pipeline, _p)
 
     history_daily = aggregate_daily_history(history)
     future_daily = aggregate_daily(future_hourly)
-    renewable_pred = forecast_renewable(history_daily, future_daily, renewable_results, chronos_pipeline, _p)
+    tech_breakdown = forecast_technology_breakdown(history_daily, future_daily, renewable_results, _p)
+    if renewable_results["_campeon"] == "XGBoost (descompuesto)":
+        # El campeón ES la suma de las 4 piezas -- no se recalcula un modelo
+        # agregado aparte, se reutiliza directamente el desglose ya calculado.
+        ref_index = next(iter(tech_breakdown.values())).index
+        renewable_pred = pd.Series(
+            np.sum([np.asarray(p.reindex(ref_index)) for p in tech_breakdown.values()], axis=0),
+            index=ref_index,
+        )
+        renewable_model_used = "XGBoost (descompuesto)"
+    else:
+        renewable_pred, renewable_model_used = forecast_renewable(
+            history_daily, future_daily, renewable_results, chronos_pipeline, _p)
 
     _p("Combinando demanda y % renovable en el resumen diario...")
     demand_daily_gwh = (demand_pred / 1000).groupby(demand_pred.index.date).sum()
@@ -255,12 +317,17 @@ def build_forecast(progress=None) -> dict:
     result = {
         "generado_en": datetime.now(timezone.utc).isoformat(),
         "historico_hasta": str(history["datetime"].max().date()),
-        "modelo_demanda": demand_results["_campeon"],
-        "modelo_renovable": renewable_results["_campeon"],
+        "modelo_demanda": demand_model_used,
+        "modelo_renovable": renewable_model_used,
         "demanda_mwh": [{"datetime": str(t), "mwh": round(float(v), 1)} for t, v in demand_pred.items()],
         "renovable_pct": [{"date": str(t.date() if hasattr(t, "date") else t), "pct": round(float(v), 1)}
                            for t, v in renewable_pred.items()],
         "resumen_diario": daily_summary,
+        "desglose_tecnologia": [
+            {"date": str(future_daily["datetime"].dt.date.iloc[i]),
+             **{sub: round(float(pred.iloc[i]), 1) for sub, pred in tech_breakdown.items()}}
+            for i in range(len(future_daily))
+        ],
     }
     _p("Predicción lista.")
     return result

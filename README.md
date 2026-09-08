@@ -4,7 +4,7 @@ Predicción a 7 días de (1) la demanda eléctrica horaria de España y (2) el %
 renovable diario, usando datos 100% reales y públicos: [REE (Red Eléctrica de
 España)](https://www.ree.es/) para demanda y mix de generación real, y
 [Open-Meteo](https://open-meteo.com/) para clima (radiación solar, viento, oleaje...). Se
-comparan 5 enfoques de forecasting de complejidad creciente -- desde un baseline ingenuo
+comparan varios enfoques de forecasting de complejidad creciente -- desde un baseline ingenuo
 hasta [Chronos-2](https://github.com/amazon-science/chronos-forecasting), el *foundation
 model* de series temporales de Amazon -- y la app final usa, para cada objetivo, el que de
 verdad funciona mejor, en vez de forzar un único modelo para todo.
@@ -34,11 +34,18 @@ documentado de forma que pueda defenderlo en una entrevista, no solo enseñarlo.
   anecdótica en el mix nacional, se esperaba (y se confirma en la importancia de variables)
   que aporte poca señal frente a sol y viento -- se reporta el resultado real, no solo el que
   "queda mejor".
+- **Viento en las 3 regiones eólicas de verdad** (Aragón, Castilla y León, Galicia), no en
+  Madrid -- Madrid no es zona eólica, y medir ahí el viento para explicar la generación
+  eólica nacional era medir en el sitio equivocado. Se usa la media, el máximo y la
+  desviación entre las tres regiones, más `wind_power_proxy` (viento medio al cubo, capado a
+  12 m/s): la potencia de un aerogenerador escala aproximadamente con el cubo de la
+  velocidad del viento, no linealmente, así que dar esa variable ya calculada le ahorra al
+  modelo tener que reconstruir la curva a base de cortes.
 - **Ciclo anual (seno/coseno del día del año)** -- con 5 años de histórico ya hay ciclos
   anuales completos de sobra para que el modelo aprenda que el % solar depende sobre todo de
   la época del año, una señal mucho más estable que la meteorología día a día.
 
-### Dos bugs reales, encontrados y corregidos
+### Bugs reales, encontrados y corregidos
 
 - **Escala rota en la API de REE.** Al construir la gráfica de mix de generación por
   tecnología, la suma de los campos `percentage` de las 13 tecnologías (sin la fila-resumen
@@ -55,6 +62,16 @@ documentado de forma que pueda defenderlo en una entrevista, no solo enseñarlo.
   si fuera un día real y parecía un desplome brutal del % renovable que ningún modelo
   acertaba. `data.py` ahora recorta del final los días con menos de 20 horas reales antes de
   guardar el dataset (`trim_incomplete_trailing_days`).
+- **Open-Meteo devuelve el viento en km/h, no en m/s.** Sin pedirlo explícitamente, `wind_power_proxy`
+  (pensado en m/s, con el corte físico a 12) capaba casi todos los valores porque en km/h
+  casi todo supera 12 -- la variable salía prácticamente constante. Se corrigió pidiendo
+  `wind_speed_unit=ms` a la API.
+- **La validación de Chronos-2 rechazaba la predicción en vivo.** En la evaluación offline el
+  histórico y el futuro son contiguos (se trocea la misma serie), pero en producción casi
+  nunca: el histórico real termina 1-2 días antes de "hoy" (por el mismo motivo del punto
+  anterior) mientras que la previsión de clima empieza "hoy". Chronos-2 valida por defecto
+  que no haya hueco entre ambos y lo rechazaba (`validate_inputs=False` para desactivarlo,
+  documentado como una discontinuidad real y esperada, no un error).
 
 ## Los modelos
 
@@ -105,32 +122,52 @@ holdout = últimos 7 días, nunca aleatorio; ya con los dos bugs corregidos)*
 | Modelo | MAE | RMSE | MAPE % | sMAPE % | R² | Mejora vs. baseline |
 |---|---|---|---|---|---|---|
 | Baseline | 3211.3 | 3811.4 | 10.37 | 11.14 | 0.15 | -- |
-| **SARIMAX 🏆** | 1607.7 | 2146.8 | **5.50** | 5.65 | 0.73 | **+47.0%** |
-| Ensemble (SARIMAX+XGBoost+Chronos-2) | 2004.5 | 2291.5 | 6.43 | 6.68 | 0.69 | +38.0% |
-| XGBoost (directo, Optuna) | 2235.7 | 2577.5 | 7.10 | 7.42 | 0.61 | +31.5% |
-| Chronos-2 (zero-shot + covariables) | 2648.5 | 2991.1 | 8.45 | 8.90 | 0.48 | +18.5% |
+| **SARIMAX 🏆** | 1631.2 | 2139.7 | **5.56** | 5.71 | 0.73 | **+46.4%** |
+| Ensemble (SARIMAX+XGBoost+Chronos-2) | 1998.7 | 2271.8 | 6.41 | 6.66 | 0.70 | +38.2% |
+| XGBoost (directo, Optuna) | 2121.8 | 2452.2 | 6.75 | 7.03 | 0.65 | +34.9% |
+| Chronos-2 (zero-shot + covariables) | 2648.6 | 2991.3 | 8.45 | 8.90 | 0.48 | +18.5% |
 
 ### % Generación renovable (horizonte 7 días)
 
 | Modelo | MAE | RMSE | MAPE % | sMAPE % | R² | Mejora vs. baseline |
 |---|---|---|---|---|---|---|
 | Baseline | 4.89 | 5.82 | 9.68 | 9.04 | -2.07 | -- |
-| **XGBoost (directo, Optuna) 🏆** | 2.69 | 3.37 | **5.26** | 5.08 | -0.03 | **+45.7%** |
-| Ensemble (SARIMAX+XGBoost+Chronos-2) | 2.97 | 3.53 | 5.78 | 5.61 | -0.13 | +40.3% |
-| SARIMAX | 3.11 | 3.61 | 6.01 | 5.87 | -0.18 | +37.9% |
-| Chronos-2 (zero-shot + covariables) | 3.18 | 3.77 | 6.25 | 6.02 | -0.29 | +35.4% |
+| **Chronos-2 (zero-shot + covariables) 🏆** | 1.27 | 1.94 | **2.56** | 2.49 | 0.66 | **+73.6%** |
+| Ensemble (SARIMAX+XGBoost+Chronos-2) | 1.64 | 1.90 | 3.21 | 3.18 | 0.67 | +66.8% |
+| SARIMAX | 1.82 | 1.89 | 3.51 | 3.52 | 0.68 | +63.7% |
+| XGBoost (directo, Optuna) | 2.12 | 2.38 | 4.10 | 4.08 | 0.49 | +57.6% |
+| XGBoost (descompuesto por tecnología) | 2.54 | 3.37 | 5.07 | 4.85 | -0.03 | +47.6% |
 
 **Por qué gana un modelo distinto en cada objetivo:** la demanda horaria tiene decenas de
 miles de puntos con un patrón diario/semanal muy estable -- ahí SARIMAX, bien especificado,
-explota ese patrón mejor que nadie (47% de mejora sobre el baseline). El % renovable diario
+explota ese patrón mejor que nadie (46% de mejora sobre el baseline). El % renovable diario
 tiene muchos menos puntos (la API de REE solo publica el mix de generación a nivel diario) y
-depende del clima día a día -- ahí, una vez corregidos los dos bugs y con el ciclo anual
-(`doy_sin`/`doy_cos`) y el forecasting directo, es XGBoost quien mejor explota esa señal
-estacional, superando a SARIMAX y a Chronos-2 por primera vez con margen claro. Los cuatro
+depende del clima día a día -- ahí, una vez corregidos los bugs (escala de REE, días
+incompletos, unidades de viento) y añadido el viento de las regiones eólicas de verdad, la
+señal quedó tan limpia que **Chronos-2 -- sin reentrenar un solo dato español -- pasa de
+6.25% a 2.56% de MAPE**, el mejor resultado de los dos objetivos con diferencia. Todos los
 modelos "de verdad" superan ya con comodidad al baseline en los dos objetivos -- antes de
-corregir los bugs, SARIMAX llegaba a quedar *peor* que el baseline en renovables, y XGBoost
-apenas se despegaba de él por el aplanamiento del forecasting recursivo. La app usa el
-campeón de cada objetivo por separado en vez de forzar un único modelo para las dos cosas.
+corregir los bugs, SARIMAX llegaba a quedar *peor* que el baseline en renovables. La app usa
+el campeón de cada objetivo por separado en vez de forzar un único modelo para las dos cosas.
+
+### Un experimento con final honesto: descomponer por tecnología
+
+Hipótesis: solar, eólica e hidráulica tienen dinámicas muy distintas (solar casi
+determinista por el ciclo anual, eólica errática, hidráulica lenta), así que predecir cada
+una por separado y sumarlas debería ganarle al modelo sobre el agregado. La primera vez que
+se probó (antes de arreglar el viento) perdía por goleada -- 8.26% frente al 5.02% del
+agregado, porque el error de la pieza más ruidosa (eólica) se acumulaba en la suma en vez de
+cancelarse. Arreglado el viento (regiones eólicas reales + unidades correctas), la eólica
+mejoró mucho (MAE de 3.87 a 1.6-1.8) y la brecha se cerró bastante -- pero repitiendo el
+experimento varias veces (incluso fijando la semilla de Optuna para quitar ruido de la
+búsqueda de hiperparámetros) el resultado osciló entre 2.58% y 5.07% de MAPE, mientras que
+Chronos-2 -- que no depende de ningún ajuste aleatorio, es zero-shot -- dio siempre
+exactamente 2.56%. Con esa varianza, decir que la descomposición "gana" sería escoger la
+tirada que más conviene, no medir de verdad: **se reporta como lo que es, un experimento que
+mejoró mucho pero no supera de forma fiable al mejor modelo agregado**, y Chronos-2 se queda
+como campeón oficial. El desglose por tecnología se mantiene en la app de todas formas (ver
+más abajo) porque ver qué aporta cada fuente es útil independientemente de qué modelo gane
+la comparativa de precisión del agregado.
 
 ![Demanda: real vs. predicción](outputs/demanda_mwh_comparativa.png)
 ![Mix de generación eléctrica por tecnología](outputs/generation_mix.png)
@@ -148,7 +185,8 @@ campeón de cada objetivo por separado en vez de forzar un único modelo para la
 - **Predicción en tiempo real**: recalculada bajo demanda con la previsión de clima real de
   los próximos 7 días (no es un stream continuo -- de ahí las comillas), con el progreso
   visible paso a paso (qué modelo se está ejecutando y cuánto lleva tardando) en vez de un
-  spinner ciego.
+  spinner ciego, más un desglose por tecnología (solar/eólica/hidráulica/otras) de la
+  predicción de % renovable, independiente de cuál sea el modelo campeón del agregado.
 - **Metodología**: las explicaciones de este README pensadas para defenderlas en una
   entrevista, no solo para leerlas.
 
@@ -178,6 +216,18 @@ app.py             # dashboard de Streamlit
 outputs/            # métricas, gráficas y predicciones generadas por los scripts
 energy_weather_hourly.csv  # dataset cacheado (se regenera con data.py)
 ```
+
+## Próximos pasos
+
+El % renovable es diario porque esa es la resolución de la API pública de REE
+(`apidatos`). Para tenerlo por hora habría que cambiar de fuente:
+- **ESIOS** (`api.esios.ree.es`), la plataforma de indicadores de REE, sí tiene generación
+  medida por tecnología a resolución horaria (y hasta un indicador directo de "% de
+  Generación Renovable Peninsular") -- pero pedir el token de API exige un CIF de empresa,
+  no vale para una cuenta personal.
+- **ENTSO-E Transparency Platform** (el operador europeo) es la alternativa: registro
+  abierto a particulares, con solicitud de acceso a la API por email. Pendiente de
+  aprobación -- en cuanto esté disponible, se integraría igual que las demás fuentes.
 
 ## Limitaciones honestas
 

@@ -218,7 +218,11 @@ def tune_xgb_params_direct(frame: pd.DataFrame, feature_names: list, n_trials: i
         pred = model.predict(X_val)
         return float(np.sqrt(np.mean((y_val.values - pred) ** 2)))
 
-    study = optuna.create_study(direction="minimize")
+    # seed fija: sin ella, dos ejecuciones sobre los mismos datos daban resultados
+    # visiblemente distintos (el MAPE de la descomposición llegó a moverse casi
+    # 1 punto entre dos pasadas) solo por el muestreo aleatorio de Optuna -- nada
+    # que ver con los datos ni el modelo, puro ruido de la búsqueda.
+    study = optuna.create_study(direction="minimize", sampler=optuna.samplers.TPESampler(seed=42))
     study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
     return study.best_params
 
@@ -282,9 +286,18 @@ def chronos_covariate_forecast(train_series: pd.Series, train_features: pd.DataF
     future_df["datetime"] = _to_uniform_utc(future_df["datetime"])
     future_df["id"] = "es"
 
+    # En la evaluación offline (train.py) el contexto y el futuro son contiguos
+    # (vienen de trocear la misma serie histórica), pero en la predicción en vivo
+    # (predict.py) casi nunca lo son: el histórico real termina 1-2 días antes de
+    # "hoy" (REE tarda en publicar, y esos días a medias se recortan aposta -- ver
+    # `trim_incomplete_trailing_days`), mientras que la previsión de clima empieza
+    # en "hoy". Chronos-2 valida por defecto que future_df empiece justo donde
+    # termina el contexto y lo rechaza si no -- aquí se desactiva esa validación
+    # a propósito: el hueco es real, esperado, y documentado, no un error.
     pred = pipeline.predict_df(
         context_df, future_df=future_df, prediction_length=horizon,
         quantile_levels=[0.1, 0.5, 0.9], id_column="id", timestamp_column="datetime", target="target",
+        validate_inputs=False,
     )
     return pred["0.5"].to_numpy()
 
@@ -359,6 +372,39 @@ def plot_feature_importance(model, feature_names, path: Path, title: str):
     fig.tight_layout()
     fig.savefig(path, dpi=150)
     plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
+# Experimento: predecir % renovable por tecnología y sumar, en vez de predecir
+# el agregado de golpe -- solar, eólica e hidráulica tienen dinámicas muy
+# distintas (solar casi determinista por el ciclo anual, eólica errática,
+# hidráulica lenta) que un único modelo sobre el agregado no puede explotar
+# tan bien como un modelo por pieza.
+# ---------------------------------------------------------------------------
+
+SUB_RENEWABLE_TARGETS = ["solar_pct", "eolica_pct", "hidraulica_pct", "otras_pct"]
+
+
+def run_decomposed_renewable(daily: pd.DataFrame, feature_cols: list, lag_steps: list,
+                              roll_windows: list, horizon: int, origin_stride: int,
+                              near_far_split: int, xgb_trials: int = 40) -> tuple:
+    data_ = daily.dropna(subset=SUB_RENEWABLE_TARGETS + feature_cols).reset_index(drop=True)
+    actual_holdout = data_.set_index("datetime")["renewable_pct"].iloc[-horizon:]
+    combined_pred = None
+    sub_models = {}
+    for sub_target in SUB_RENEWABLE_TARGETS:
+        pred, model, feat_names, params = xgb_direct_forecast(
+            data_, sub_target, horizon, lag_steps, roll_windows, feature_cols, origin_stride, xgb_trials
+        )
+        sub_actual = data_.set_index("datetime")[sub_target].iloc[-horizon:]
+        sub_models[sub_target] = {"mejores_hiperparametros": params}
+        combined_pred = pred if combined_pred is None else combined_pred.add(pred, fill_value=0)
+        print(f"  -- {sub_target}: MAE {metrics(sub_actual, pred)['MAE']}")
+
+    result = metrics(actual_holdout, combined_pred)
+    result.update(horizon_breakdown(actual_holdout.values, combined_pred.values, near_far_split))
+    result["sub_modelos"] = sub_models
+    return result, combined_pred
 
 
 # ---------------------------------------------------------------------------
@@ -505,6 +551,12 @@ def main():
     daily = (
         df.groupby(df["datetime"].dt.date)
         .agg(renewable_pct=("renewable_pct", "first"),
+             tech_solar_fv_pct=("tech_solar_fv_pct", "first"),
+             tech_solar_termica_pct=("tech_solar_termica_pct", "first"),
+             tech_eolica_pct=("tech_eolica_pct", "first"),
+             tech_hidraulica_pct=("tech_hidraulica_pct", "first"),
+             tech_otras_renovables_pct=("tech_otras_renovables_pct", "first"),
+             tech_residuos_renovables_pct=("tech_residuos_renovables_pct", "first"),
              shortwave_radiation=("shortwave_radiation", "mean"),
              shortwave_radiation_max=("shortwave_radiation", "max"),
              direct_radiation=("direct_radiation", "mean"),
@@ -513,6 +565,11 @@ def main():
              wind_speed_10m_max=("wind_speed_10m", "max"),
              wind_speed_100m=("wind_speed_100m", "mean"),
              wind_speed_100m_max=("wind_speed_100m", "max"),
+             wind_national_mean_100m=("wind_national_mean_100m", "mean"),
+             wind_national_max_100m=("wind_national_max_100m", "max"),
+             wind_national_std_100m=("wind_national_std_100m", "mean"),
+             wind_power_proxy=("wind_power_proxy", "mean"),
+             wind_power_proxy_max=("wind_power_proxy", "max"),
              precipitation=("precipitation", "sum"),
              surface_pressure=("surface_pressure", "mean"),
              wave_height=("wave_height", "mean"),
@@ -523,6 +580,10 @@ def main():
         .reset_index()
     )
     daily["datetime"] = pd.to_datetime(daily["datetime"])
+    daily["solar_pct"] = daily["tech_solar_fv_pct"] + daily["tech_solar_termica_pct"]
+    daily["eolica_pct"] = daily["tech_eolica_pct"]
+    daily["hidraulica_pct"] = daily["tech_hidraulica_pct"]
+    daily["otras_pct"] = daily["tech_otras_renovables_pct"] + daily["tech_residuos_renovables_pct"]
     # doy_sin/doy_cos (ciclo anual) son, con diferencia, las variables que más
     # deberían pesar aquí: el % solar depende sobre todo de en qué época del año
     # estamos, mucho más estable año a año que la meteorología día a día -- con
@@ -530,7 +591,9 @@ def main():
     # modelo pueda aprovecharlas.
     renewable_features = ["shortwave_radiation", "shortwave_radiation_max", "direct_radiation",
                            "cloud_cover", "wind_speed_10m", "wind_speed_10m_max",
-                           "wind_speed_100m", "wind_speed_100m_max", "precipitation",
+                           "wind_speed_100m", "wind_speed_100m_max",
+                           "wind_national_mean_100m", "wind_national_max_100m", "wind_national_std_100m",
+                           "wind_power_proxy", "wind_power_proxy_max", "precipitation",
                            "surface_pressure", "wave_height", "doy_sin", "doy_cos",
                            "is_weekend", "is_holiday"]
     roll_windows_renewable = [7, 30] if len(daily) > 400 else [7]
@@ -542,6 +605,46 @@ def main():
         chronos_pipeline=chronos_pipeline, label="% Generación renovable", ylabel="%",
         near_far_split=1, origin_stride=1, sarimax_period=7,
     )
+
+    print("\n-- Experimento: % renovable descompuesto por tecnología (solar+eólica+hidráulica+otras) --")
+    decomposed_result, decomposed_pred = run_decomposed_renewable(
+        daily, renewable_features, lag_steps_renewable, roll_windows_renewable,
+        horizon=7, origin_stride=1, near_far_split=1,
+    )
+    baseline_mape = all_results["renewable_pct"]["Baseline"]["MAPE_%"]
+    decomposed_result["mejora_vs_baseline_%"] = round(
+        (baseline_mape - decomposed_result["MAPE_%"]) / baseline_mape * 100, 1)
+    print("XGBoost (descompuesto):", {k: v for k, v in decomposed_result.items() if k != "sub_modelos"})
+    all_results["renewable_pct"]["XGBoost (descompuesto)"] = decomposed_result
+    best_pure = min(
+        (k for k in all_results["renewable_pct"] if k != "_campeon"),
+        key=lambda name: all_results["renewable_pct"][name]["MAPE_%"],
+    )
+    previous_champion = all_results["renewable_pct"]["_campeon"]
+    # Regla de desempate documentada, no un override silencioso: si la
+    # descomposición por tecnología queda dentro de 0.5 puntos de MAPE del mejor
+    # modelo puro, se prefiere -- a igualdad (casi) de precisión, da además el
+    # desglose por tecnología gratis, que el modelo agregado no puede ofrecer.
+    TIE_TOLERANCE = 0.5
+    decomposed_mape = decomposed_result["MAPE_%"]
+    best_pure_mape = all_results["renewable_pct"][best_pure]["MAPE_%"]
+    if decomposed_mape <= best_pure_mape + TIE_TOLERANCE:
+        champion = "XGBoost (descompuesto)"
+    else:
+        champion = best_pure
+    all_results["renewable_pct"]["_campeon"] = champion
+    if champion == "XGBoost (descompuesto)":
+        print(f"Campeón: XGBoost (descompuesto) -- MAPE {decomposed_mape}% frente a {best_pure_mape}% "
+              f"del mejor modelo agregado ({best_pure}); dentro de la tolerancia de empate "
+              f"({TIE_TOLERANCE} puntos), y de propina da el desglose por tecnología.")
+    else:
+        print(f"La descomposición no queda lo bastante cerca del campeón ({previous_champion}, "
+              f"MAPE {best_pure_mape}% vs. {decomposed_mape}%) -- se reporta igualmente, no se fuerza.")
+
+    holdout_path = OUTPUT_DIR / "renewable_pct_predicciones_holdout.csv"
+    holdout_df = pd.read_csv(holdout_path)
+    holdout_df["XGBoost (descompuesto)"] = decomposed_pred.values[: len(holdout_df)]
+    holdout_df.to_csv(holdout_path, index=False)
 
     with open(OUTPUT_DIR / "metrics.json", "w") as fh:
         json.dump(all_results, fh, indent=2, ensure_ascii=False)

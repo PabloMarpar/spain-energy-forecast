@@ -25,8 +25,10 @@ st.set_page_config(page_title="Demanda eléctrica y renovables en España", page
 # "real" en blanco roto para que destaque siempre sobre el fondo oscuro, algo que
 # el negro casi puro que se usa en las gráficas estáticas (fondo blanco) no hacía.
 COLORS = {"real": "#f2f2f2", "Baseline": "#9aa0a6", "SARIMAX": "#ff8a3d",
-          "XGBoost": "#4da3ff", "Chronos-2": "#2dd4a7", "Ensemble": "#c874e0"}
-DASH = {"Baseline": "dot", "SARIMAX": "dash", "XGBoost": "dashdot", "Chronos-2": "dash", "Ensemble": "longdash"}
+          "XGBoost": "#4da3ff", "Chronos-2": "#2dd4a7", "Ensemble": "#c874e0",
+          "XGBoost (descompuesto)": "#ffc857"}
+DASH = {"Baseline": "dot", "SARIMAX": "dash", "XGBoost": "dashdot", "Chronos-2": "dash",
+        "Ensemble": "longdash", "XGBoost (descompuesto)": "dot"}
 
 TECH_BUCKETS = {
     "Solar": ["tech_solar_fv_pct", "tech_solar_termica_pct"],
@@ -297,6 +299,27 @@ cachea unas horas para no repetir el cálculo en cada visita).
         fig_r = line_chart(renovable_fut["date"], {"predicción % renovable": renovable_fut["pct"]},
                             "% de generación renovable prevista", "%")
         st.plotly_chart(fig_r, use_container_width=True)
+
+        if forecast.get("desglose_tecnologia"):
+            st.markdown("#### Desglose por tecnología (solar, eólica, hidráulica, otras)")
+            st.caption("Cada tecnología se predice por separado y se muestra tal cual -- no es la "
+                       "descomposición la que gana la comparativa de precisión (ver pestaña anterior), "
+                       "pero ver el reparto por fuente es útil aunque el modelo campeón sea el que "
+                       "predice el % total de una sola vez.")
+            tech_df = pd.DataFrame(forecast["desglose_tecnologia"])
+            fig_tech = go.Figure()
+            tech_labels = {"solar_pct": "Solar", "eolica_pct": "Eólica",
+                           "hidraulica_pct": "Hidráulica", "otras_pct": "Otras renovables"}
+            for col, label in tech_labels.items():
+                if col in tech_df.columns:
+                    fig_tech.add_trace(go.Bar(x=tech_df["date"], y=tech_df[col], name=label,
+                                               marker_color=BUCKET_COLORS.get(label)))
+            fig_tech.update_layout(
+                barmode="stack", title="% renovable previsto, por tecnología", yaxis_title="%",
+                template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                legend=dict(orientation="h", y=1.12), margin=dict(t=60, l=10, r=10), height=420,
+            )
+            st.plotly_chart(fig_tech, use_container_width=True)
 
 # ---------------------------------------------------------------------------
 # Tab: metodología / comprensión
