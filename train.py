@@ -34,7 +34,7 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 COLORS = {"Real": "#0b0b0b", "Baseline": "#898781", "SARIMAX": "#eb6834",
-          "XGBoost": "#2a78d6", "Chronos-2": "#1baf7a"}
+          "XGBoost": "#2a78d6", "Chronos-2": "#1baf7a", "Ensemble": "#8e44ad"}
 
 
 # ---------------------------------------------------------------------------
@@ -267,6 +267,46 @@ def plot_comparison(actual: pd.Series, forecasts: dict, title: str, ylabel: str,
     plt.close(fig)
 
 
+GENERATION_BUCKETS = {
+    "Solar": ["tech_solar_fv_pct", "tech_solar_termica_pct"],
+    "Eólica": ["tech_eolica_pct"],
+    "Hidráulica": ["tech_hidraulica_pct"],
+    "Otras renovables": ["tech_otras_renovables_pct", "tech_residuos_renovables_pct"],
+    "Nuclear": ["tech_nuclear_pct"],
+    "No renovable (resto)": ["tech_carbon_pct", "tech_fuel_gas_pct", "tech_turbina_vapor_pct",
+                              "tech_ciclo_combinado_pct", "tech_cogeneracion_pct",
+                              "tech_residuos_no_renovables_pct"],
+}
+GENERATION_COLORS = {"Solar": "#f4b400", "Eólica": "#4285f4", "Hidráulica": "#1a73e8",
+                      "Otras renovables": "#34a853", "Nuclear": "#9c27b0", "No renovable (resto)": "#5f6368"}
+
+
+def plot_generation_mix(df: pd.DataFrame, path: Path, days: int = 730):
+    """Stacked-area del mix de generación por tecnología -- el estilo de gráfica
+    estándar del sector para "cuánto pone cada fuente" (el mismo que usan REE,
+    ENTSO-E o cualquier operador del sistema), no solo el % renovable agregado."""
+    daily = df.groupby(df["datetime"].dt.date).first(numeric_only=True).tail(days)
+    x = pd.to_datetime(daily.index)
+    values, labels, colors = [], [], []
+    for name, cols in GENERATION_BUCKETS.items():
+        present = [c for c in cols if c in daily.columns]
+        if not present:
+            continue
+        values.append(daily[present].sum(axis=1).values)
+        labels.append(name)
+        colors.append(GENERATION_COLORS[name])
+    fig, ax = plt.subplots(figsize=(11, 5))
+    ax.stackplot(x, values, labels=labels, colors=colors, alpha=0.92)
+    ax.set_title(f"Mix de generación eléctrica en España (% diario, últimos {days // 365} años)")
+    ax.set_ylabel("%")
+    ax.set_ylim(0, 100)
+    ax.legend(loc="upper center", ncol=3, bbox_to_anchor=(0.5, -0.14))
+    fig.autofmt_xdate()
+    fig.tight_layout()
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
 def plot_feature_importance(model, feature_names, path: Path, title: str):
     importance = model.feature_importances_
     order = np.argsort(importance)[::-1]
@@ -348,6 +388,21 @@ def run_comparison(df: pd.DataFrame, target_col: str, horizon: int, baseline_sea
     except Exception as exc:
         print(f"Chronos-2 falló ({exc}), se omite de la comparativa.")
 
+    # Ensemble = media simple de los modelos "de verdad" (no el baseline). Promediar
+    # modelos con errores no perfectamente correlacionados suele reducir el error
+    # total -- es una técnica estándar, no un intento de inflar el resultado: se
+    # reporta con sus métricas como uno más, y solo "gana" si de verdad mejora.
+    non_baseline = {k: v for k, v in forecasts.items() if k != "Baseline"}
+    if len(non_baseline) >= 2:
+        ensemble_pred = np.mean([np.asarray(v)[: len(actual_holdout)] for v in non_baseline.values()], axis=0)
+        forecasts["Ensemble"] = ensemble_pred
+        results["Ensemble"] = metrics(actual_holdout, ensemble_pred)
+        results["Ensemble"].update(horizon_breakdown(actual_holdout.values, ensemble_pred, near_far_split))
+        results["Ensemble"]["compuesto_por"] = list(non_baseline.keys())
+        results["Ensemble"]["mejora_vs_baseline_%"] = round(
+            (baseline_mape - results["Ensemble"]["MAPE_%"]) / baseline_mape * 100, 1)
+        print("Ensemble (media):", results["Ensemble"])
+
     champion = min(results.keys(), key=lambda name: results[name]["MAPE_%"])
     results["_campeon"] = champion
     print(f"Campeón para {label}: {champion} (MAPE {results[champion]['MAPE_%']}%)")
@@ -387,6 +442,8 @@ def main():
     df["hour_sin"] = np.sin(2 * np.pi * df["hour"] / 24)
     df["hour_cos"] = np.cos(2 * np.pi * df["hour"] / 24)
 
+    plot_generation_mix(df, OUTPUT_DIR / "generation_mix.png")
+
     print("Cargando Chronos-2 (foundation model, se descarga la primera vez)...")
     chronos_pipeline = Chronos2Pipeline.from_pretrained("amazon/chronos-2", device_map="cpu")
 
@@ -407,21 +464,33 @@ def main():
         df.groupby(df["datetime"].dt.date)
         .agg(renewable_pct=("renewable_pct", "first"),
              shortwave_radiation=("shortwave_radiation", "mean"),
+             shortwave_radiation_max=("shortwave_radiation", "max"),
              direct_radiation=("direct_radiation", "mean"),
              cloud_cover=("cloud_cover", "mean"),
              wind_speed_10m=("wind_speed_10m", "mean"),
+             wind_speed_10m_max=("wind_speed_10m", "max"),
              wind_speed_100m=("wind_speed_100m", "mean"),
+             wind_speed_100m_max=("wind_speed_100m", "max"),
              precipitation=("precipitation", "sum"),
              surface_pressure=("surface_pressure", "mean"),
              wave_height=("wave_height", "mean"),
+             doy_sin=("doy_sin", "first"),
+             doy_cos=("doy_cos", "first"),
              is_weekend=("is_weekend", "max"),
              is_holiday=("is_holiday", "max"))
         .reset_index()
     )
     daily["datetime"] = pd.to_datetime(daily["datetime"])
-    renewable_features = ["shortwave_radiation", "direct_radiation", "cloud_cover",
-                           "wind_speed_10m", "wind_speed_100m", "precipitation",
-                           "surface_pressure", "wave_height", "is_weekend", "is_holiday"]
+    # doy_sin/doy_cos (ciclo anual) son, con diferencia, las variables que más
+    # deberían pesar aquí: el % solar depende sobre todo de en qué época del año
+    # estamos, mucho más estable año a año que la meteorología día a día -- con
+    # 5 años de histórico ya hay suficientes ciclos anuales completos para que el
+    # modelo pueda aprovecharlas.
+    renewable_features = ["shortwave_radiation", "shortwave_radiation_max", "direct_radiation",
+                           "cloud_cover", "wind_speed_10m", "wind_speed_10m_max",
+                           "wind_speed_100m", "wind_speed_100m_max", "precipitation",
+                           "surface_pressure", "wave_height", "doy_sin", "doy_cos",
+                           "is_weekend", "is_holiday"]
     roll_windows_renewable = [7, 30] if len(daily) > 400 else [7]
     lag_steps_renewable = [1, 7, 14, 30, 365] if len(daily) > 400 else [1, 7, 14]
     all_results["renewable_pct"] = run_comparison(

@@ -1,8 +1,8 @@
 {
-  "generado_en": "2026-09-08T10:57:18.325767+00:00",
+  "generado_en": "2026-09-08T11:48:12.719549+00:00",
   "historico_hasta": "2026-09-07",
   "modelo_demanda": "SARIMAX",
-  "modelo_renovable": "Chronos-2",
+  "modelo_renovable": "XGBoost",
   "demanda_mwh": [
     {
       "datetime": "2026-09-08 00:00:00+02:00",
@@ -680,75 +680,75 @@
   "renovable_pct": [
     {
       "date": "2026-09-08",
-      "pct": 23.1
+      "pct": 41.2
     },
     {
       "date": "2026-09-09",
-      "pct": 29.3
+      "pct": 46.6
     },
     {
       "date": "2026-09-10",
-      "pct": 25.2
+      "pct": 51.6
     },
     {
       "date": "2026-09-11",
-      "pct": 24.1
+      "pct": 54.3
     },
     {
       "date": "2026-09-12",
-      "pct": 27.7
+      "pct": 56.2
     },
     {
       "date": "2026-09-13",
-      "pct": 25.1
+      "pct": 54.5
     },
     {
       "date": "2026-09-14",
-      "pct": 25.1
+      "pct": 50.0
     }
   ],
   "resumen_diario": [
     {
       "date": "2026-09-08",
       "demanda_gwh": 729.3,
-      "renovable_%": 23.1,
-      "renovable_gwh": 168.3
+      "renovable_%": 41.2,
+      "renovable_gwh": 300.4
     },
     {
       "date": "2026-09-09",
       "demanda_gwh": 684.6,
-      "renovable_%": 29.3,
-      "renovable_gwh": 200.6
+      "renovable_%": 46.6,
+      "renovable_gwh": 319.1
     },
     {
       "date": "2026-09-10",
       "demanda_gwh": 566.8,
-      "renovable_%": 25.2,
-      "renovable_gwh": 142.6
+      "renovable_%": 51.6,
+      "renovable_gwh": 292.6
     },
     {
       "date": "2026-09-11",
       "demanda_gwh": 604.4,
-      "renovable_%": 24.1,
-      "renovable_gwh": 145.9
+      "renovable_%": 54.3,
+      "renovable_gwh": 328.0
     },
     {
       "date": "2026-09-12",
       "demanda_gwh": 561.2,
-      "renovable_%": 27.7,
-      "renovable_gwh": 155.4
+      "renovable_%": 56.2,
+      "renovable_gwh": 315.5
     },
     {
       "date": "2026-09-13",
       "demanda_gwh": 592.2,
-      "renovable_%": 25.1,
-      "renovable_gwh": 148.7
+      "renovable_%": 54.5,
+      "renovable_gwh": 322.9
     },
     {
       "date": "2026-09-14",
       "demanda_gwh": 675.4,
-      "renovable_%": 25.1,
-      "renovable_gwh": 169.8
+      "renovable_%": 50.0,
+      "renovable_gwh": 337.5
     }
   ]
 }

@@ -14,6 +14,7 @@ from datetime import date, timedelta
 from pathlib import Path
 
 import holidays
+import numpy as np
 import pandas as pd
 import requests
 
@@ -32,6 +33,18 @@ LAT, LON = 40.4168, -3.7038
 MARINE_LAT, MARINE_LON = 43.30, -2.38
 
 RENEWABLE_KEYWORDS = ["solar", "eólic", "eolic", "hidrául", "hidraul", "hidroeólica", "renovable", "geotérmica"]
+
+# Nombre de tecnología (tal cual lo da REE) -> columna corta, para poder guardar el
+# desglose completo del mix (no solo el agregado renovable/no renovable) y montar
+# gráficas de "generation mix" tipo stacked-area, el estándar visual del sector.
+TECH_SLUG = {
+    "hidráulica": "hidraulica", "nuclear": "nuclear", "carbón": "carbon",
+    "fuel + gas": "fuel_gas", "turbina de vapor": "turbina_vapor",
+    "ciclo combinado": "ciclo_combinado", "eólica": "eolica",
+    "solar fotovoltaica": "solar_fv", "solar térmica": "solar_termica",
+    "otras renovables": "otras_renovables", "cogeneración": "cogeneracion",
+    "residuos no renovables": "residuos_no_renovables", "residuos renovables": "residuos_renovables",
+}
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; portfolio-research-script/1.0)"}
 
@@ -99,13 +112,33 @@ def fetch_ree_demanda(start: date, end: date) -> pd.DataFrame:
 
 
 def fetch_ree_generacion(start: date, end: date) -> pd.DataFrame:
-    """Devuelve % de generación renovable por DÍA (esta serie de REE es diaria, no horaria).
+    """Devuelve % de generación renovable por DÍA (esta serie de REE es diaria, no
+    horaria -- se probó en vivo pedir `time_trunc=hour` a este endpoint en concreto
+    y REE lo rechaza siempre con 400, a diferencia de demanda que sí lo soporta).
 
-    Usa el campo `percentage` que ya trae cada tecnología (fracción sobre el total),
-    en vez de recalcularlo a partir de los MWh -- así no hay que preocuparse por la
-    fila-resumen "Generación total" que la API incluye junto a las tecnologías reales.
+    Además del agregado renovable/no renovable, guarda el % de cada tecnología por
+    separado (`tech_<nombre>_pct`) -- no solo para tener más variables, sino porque
+    es lo que hace falta para una gráfica de mix de generación tipo stacked-area
+    (el estándar visual del sector: cuánto pone cada tecnología en cada momento),
+    y porque solar y eólica tienen dinámicas muy distintas (solar es un ciclo anual
+    y diario muy predecible, eólica es mucho más errática) que se pierden al
+    mirar solo el agregado.
+
+    IMPORTANTE -- bug real de la API descubierto en vivo: el campo `percentage`
+    que trae cada tecnología NO es la fracción sobre el total (aunque el nombre
+    del campo lo sugiere). Se comprobó pidiendo un día suelto: sumando el
+    `percentage` de las 13 tecnologías reales (sin la fila "Generación total")
+    da exactamente 0.5000000, la mitad de lo que debería (1.0) -- pero sumando
+    los `value` (MWh) de esas mismas 13 tecnologías da EXACTAMENTE el mismo MWh
+    que la fila "Generación total". Es decir: `percentage` viene escalado a la
+    mitad por lo que sea (posible peculiaridad interna de REE), pero `value` es
+    fiable. Por eso aquí el % de cada tecnología se calcula a mano como
+    `value_tecnología / value_total`, ignorando el campo `percentage` de la API
+    -- de lo contrario el % renovable habría salido sistemáticamente a la mitad
+    de su valor real (p.ej. un 46% real habría salido como ~23%).
     """
     rows = []
+    totals = {}
     pending = list(_date_chunks(start, end))
     for _pass in range(2):
         still_pending = []
@@ -125,13 +158,16 @@ def fetch_ree_generacion(start: date, end: date) -> pd.DataFrame:
             for tech in data["included"]:
                 tech_name = tech.get("type", "")
                 if "total" in tech_name.lower():
-                    continue  # fila-resumen, no es una tecnología real
+                    for v in tech["attributes"]["values"]:
+                        totals[v["datetime"][:10]] = v["value"]
+                    continue  # fila-resumen: se guarda como denominador, no como fila de tecnología
                 is_renewable = any(k in tech_name.lower() for k in RENEWABLE_KEYWORDS)
+                slug = TECH_SLUG.get(tech_name.lower().strip(), tech_name.lower().replace(" ", "_"))
                 for v in tech["attributes"]["values"]:
                     rows.append({
                         "date": v["datetime"][:10],
-                        "tech": tech_name,
-                        "percentage": v.get("percentage") or 0.0,
+                        "slug": slug,
+                        "value_mwh": v["value"],
                         "is_renewable": is_renewable,
                     })
             time.sleep(1.0)
@@ -143,16 +179,29 @@ def fetch_ree_generacion(start: date, end: date) -> pd.DataFrame:
     if pending:
         print(f"  aviso: {len(pending)} meses de generación no se pudieron descargar tras 2 pasadas: {pending}")
     df = pd.DataFrame(rows)
-    daily_pct = (
-        df.groupby(["date", "is_renewable"])["percentage"].sum()
+    df["total_mwh"] = df["date"].map(totals)
+
+    daily_mwh = (
+        df.groupby(["date", "is_renewable"])["value_mwh"].sum()
         .unstack("is_renewable", fill_value=0)
     )
-    daily_pct = daily_pct.rename(columns={True: "renewable_frac", False: "nonrenewable_frac"})
-    for col in ("renewable_frac", "nonrenewable_frac"):
-        if col not in daily_pct.columns:
-            daily_pct[col] = 0.0
-    daily_pct["renewable_pct"] = daily_pct["renewable_frac"] * 100
-    return daily_pct.reset_index()[["date", "renewable_pct"]]
+    daily_mwh = daily_mwh.rename(columns={True: "renewable_mwh", False: "nonrenewable_mwh"})
+    for col in ("renewable_mwh", "nonrenewable_mwh"):
+        if col not in daily_mwh.columns:
+            daily_mwh[col] = 0.0
+    daily_mwh["total_mwh"] = daily_mwh.index.map(totals)
+    # En ~0.3% de los días la suma de tecnologías supera muy ligeramente (100-103%)
+    # el valor de "Generación total" que publica REE -- redondeos independientes
+    # entre ambas cifras en la fuente, no un error de este script. Se recorta a 100.
+    daily_mwh["renewable_pct"] = (daily_mwh["renewable_mwh"] / daily_mwh["total_mwh"] * 100).clip(upper=100)
+
+    df["percentage"] = df["value_mwh"] / df["total_mwh"] * 100
+    tech_pivot = df.pivot_table(index="date", columns="slug", values="percentage", aggfunc="sum", fill_value=0.0)
+    tech_pivot.columns = [f"tech_{c}_pct" for c in tech_pivot.columns]
+
+    return daily_mwh.reset_index()[["date", "renewable_pct"]].merge(
+        tech_pivot.reset_index(), on="date", how="left"
+    )
 
 
 def _fetch_open_meteo(url: str, lat: float, lon: float, hourly_vars: str,
@@ -216,6 +265,14 @@ def add_calendar_features(df: pd.DataFrame) -> pd.DataFrame:
     df["month"] = df["datetime"].dt.month
     df["is_weekend"] = df["dayofweek"].isin([5, 6]).astype(int)
     df["is_holiday"] = df["datetime"].dt.date.astype("O").apply(lambda d: d in es_holidays).astype(int)
+    # Ciclo anual como seno/coseno (día 365 y día 1 quedan "cerca" el uno del otro,
+    # cosa que un entero de día-del-año 1-365 no representa bien). Es la variable
+    # que más explica el % de generación solar: en España hay mucha más luz e
+    # irradiancia en junio que en diciembre, con un patrón que se repite cada año
+    # de forma mucho más fiable que la meteorología día a día.
+    doy = df["datetime"].dt.dayofyear
+    df["doy_sin"] = np.sin(2 * np.pi * doy / 365.25)
+    df["doy_cos"] = np.cos(2 * np.pi * doy / 365.25)
     return df
 
 

@@ -34,24 +34,24 @@
       "mejora_vs_baseline_%": 44.0
     },
     "XGBoost": {
-      "MAE": 2452.143,
-      "RMSE": 2678.306,
-      "MAPE_%": 7.91,
-      "sMAPE_%": 8.29,
-      "R2": 0.515,
-      "Bias": 2452.143,
-      "MAPE_dia1_%": 5.84,
-      "MAPE_dia7_%": 10.99,
+      "MAE": 2542.572,
+      "RMSE": 2773.942,
+      "MAPE_%": 8.18,
+      "sMAPE_%": 8.59,
+      "R2": 0.48,
+      "Bias": 2542.572,
+      "MAPE_dia1_%": 5.87,
+      "MAPE_dia7_%": 10.93,
       "mejores_hiperparametros": {
-        "n_estimators": 525,
+        "n_estimators": 396,
         "max_depth": 7,
-        "learning_rate": 0.05080035703182098,
-        "subsample": 0.7706489120613069,
-        "colsample_bytree": 0.7778267770902159,
+        "learning_rate": 0.07081019571079895,
+        "subsample": 0.9301283722554106,
+        "colsample_bytree": 0.7808298450285533,
         "min_child_weight": 8,
-        "reg_lambda": 2.384788214563802
+        "reg_lambda": 0.10130240987574642
       },
-      "mejora_vs_baseline_%": 27.8
+      "mejora_vs_baseline_%": 25.4
     },
     "Chronos-2": {
       "MAE": 2772.188,
@@ -64,32 +64,48 @@
       "MAPE_dia7_%": 11.98,
       "mejora_vs_baseline_%": 19.2
     },
+    "Ensemble": {
+      "MAE": 2290.537,
+      "RMSE": 2530.544,
+      "MAPE_%": 7.37,
+      "sMAPE_%": 7.7,
+      "R2": 0.567,
+      "Bias": 2290.537,
+      "MAPE_dia1_%": 3.81,
+      "MAPE_dia7_%": 7.45,
+      "compuesto_por": [
+        "SARIMAX",
+        "XGBoost",
+        "Chronos-2"
+      ],
+      "mejora_vs_baseline_%": 32.8
+    },
     "_campeon": "SARIMAX"
   },
   "renewable_pct": {
     "Baseline": {
-      "MAE": 5.966,
-      "RMSE": 7.922,
-      "MAPE_%": 28.83,
-      "sMAPE_%": 23.04,
-      "R2": -0.315,
-      "Bias": -2.597,
-      "MAPE_dia1_%": 4.36,
+      "MAE": 9.092,
+      "RMSE": 13.176,
+      "MAPE_%": 25.57,
+      "sMAPE_%": 18.98,
+      "R2": -1.333,
+      "Bias": -9.092,
+      "MAPE_dia1_%": 4.37,
       "MAPE_dia7_%": 114.44
     },
     "SARIMAX": {
-      "MAE": 7.552,
-      "RMSE": 8.934,
-      "MAPE_%": 35.88,
-      "sMAPE_%": 28.17,
-      "R2": -0.673,
-      "Bias": -4.482,
-      "MAPE_dia1_%": 5.39,
-      "MAPE_dia7_%": 123.64,
-      "orden": "(2, 0, 1)x(0, 0, 0, 7)",
+      "MAE": 7.95,
+      "RMSE": 11.389,
+      "MAPE_%": 22.32,
+      "sMAPE_%": 17.11,
+      "R2": -0.743,
+      "Bias": -7.95,
+      "MAPE_dia1_%": 4.22,
+      "MAPE_dia7_%": 100.5,
+      "orden": "(2, 1, 1)x(0, 0, 0, 7)",
       "orden_pdq": [
         2,
-        0,
+        1,
         1
       ],
       "orden_estacional": [
@@ -98,39 +114,55 @@
         0,
         7
       ],
-      "mejora_vs_baseline_%": -24.5
+      "mejora_vs_baseline_%": 12.7
     },
     "XGBoost": {
-      "MAE": 5.276,
-      "RMSE": 7.34,
-      "MAPE_%": 25.08,
-      "sMAPE_%": 19.22,
-      "R2": -0.129,
-      "Bias": -5.276,
-      "MAPE_dia1_%": 6.57,
-      "MAPE_dia7_%": 102.64,
+      "MAE": 6.243,
+      "RMSE": 10.297,
+      "MAPE_%": 18.61,
+      "sMAPE_%": 14.05,
+      "R2": -0.424,
+      "Bias": -6.243,
+      "MAPE_dia1_%": 2.94,
+      "MAPE_dia7_%": 95.02,
       "mejores_hiperparametros": {
-        "n_estimators": 496,
-        "max_depth": 4,
-        "learning_rate": 0.02686069415245766,
-        "subsample": 0.8921071764910875,
-        "colsample_bytree": 0.9678959305350419,
-        "min_child_weight": 6,
-        "reg_lambda": 0.1775481374477821
+        "n_estimators": 421,
+        "max_depth": 5,
+        "learning_rate": 0.013854033700280674,
+        "subsample": 0.859389625853192,
+        "colsample_bytree": 0.9626636306758574,
+        "min_child_weight": 3,
+        "reg_lambda": 3.6487455962369597
       },
-      "mejora_vs_baseline_%": 13.0
+      "mejora_vs_baseline_%": 27.2
     },
     "Chronos-2": {
-      "MAE": 4.086,
-      "RMSE": 5.876,
-      "MAPE_%": 21.55,
-      "sMAPE_%": 16.45,
-      "R2": 0.276,
-      "Bias": -4.086,
-      "MAPE_dia1_%": 1.77,
-      "MAPE_dia7_%": 99.0,
-      "mejora_vs_baseline_%": 25.3
+      "MAE": 7.849,
+      "RMSE": 11.569,
+      "MAPE_%": 22.31,
+      "sMAPE_%": 16.91,
+      "R2": -0.798,
+      "Bias": -7.849,
+      "MAPE_dia1_%": 4.79,
+      "MAPE_dia7_%": 103.42,
+      "mejora_vs_baseline_%": 12.7
     },
-    "_campeon": "Chronos-2"
+    "Ensemble": {
+      "MAE": 7.347,
+      "RMSE": 11.062,
+      "MAPE_%": 21.08,
+      "sMAPE_%": 16.04,
+      "R2": -0.644,
+      "Bias": -7.347,
+      "MAPE_dia1_%": 3.98,
+      "MAPE_dia7_%": 99.65,
+      "compuesto_por": [
+        "SARIMAX",
+        "XGBoost",
+        "Chronos-2"
+      ],
+      "mejora_vs_baseline_%": 17.6
+    },
+    "_campeon": "XGBoost"
   }
 }
