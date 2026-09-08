@@ -134,28 +134,74 @@ def sarimax_auto_forecast(series: pd.Series, exog: pd.DataFrame, horizon: int,
 
 
 # ---------------------------------------------------------------------------
-# XGBoost recursivo con hiperparámetros ajustados por Optuna
+# XGBoost DIRECTO multi-horizonte (con "h" como feature), Optuna
 # ---------------------------------------------------------------------------
+#
+# Antes esto era un forecast RECURSIVO: un modelo a 1 paso, cuya propia
+# predicción se realimentaba como "lag" del siguiente paso. Con un horizonte de
+# 168 (demanda) o 7 (renovables) eso encadena mucho error y, peor, tiende a
+# "aplanarse": en cuanto el modelo predice un valor cercano a la media, ese
+# valor suavizado pasa a ser el lag del siguiente paso, y el siguiente, y el
+# siguiente -- se vio clarísimo en la comparativa de renovables (la predicción
+# apenas se movía semana a semana mientras el real oscilaba mucho más), y la
+# importancia de variables lo confirmaba: `lag_1` acaparaba ~60% de la
+# importancia, todo el clima junto no llegaba al 15%.
+#
+# Ahora es DIRECTO: un único modelo aprende a predecir cualquier paso h=1..H
+# por delante, con `h` como variable más, a partir de lags/medias móviles
+# calculados SIEMPRE con datos reales del origen (nunca con predicciones
+# encadenadas) más el clima/calendario del instante futuro. El dataset de
+# entrenamiento se construye tomando un origen de cada `origin_stride` pasos
+# (no todas las horas) para que cada fila se parezca a como se usa el modelo
+# de verdad -- una predicción de horizonte completo por vez, no una por hora.
 
-def build_lagged_frame(df: pd.DataFrame, target_col: str, lag_steps: list,
-                        roll_windows: list, feature_cols: list) -> pd.DataFrame:
-    out = df[["datetime", target_col] + feature_cols].copy()
-    for lag in lag_steps:
-        out[f"lag_{lag}"] = df[target_col].shift(lag)
-    for win in roll_windows:
+def _lag_roll_features(series: pd.Series, lag_steps: list, roll_windows: list) -> pd.DataFrame:
+    feats = {f"lag_{l}": series.shift(l) for l in lag_steps}
+    for w in roll_windows:
         # shift(1) antes del rolling: la media solo puede usar valores anteriores
         # al instante que se predice, nunca el propio valor (fuga de información).
-        out[f"roll_{win}"] = df[target_col].shift(1).rolling(win).mean()
-    return out.dropna().reset_index(drop=True)
+        feats[f"roll_{w}"] = series.shift(1).rolling(w).mean()
+    return pd.DataFrame(feats)
 
 
-def tune_xgb_params(X: pd.DataFrame, y: pd.Series, n_trials: int = 40) -> dict:
-    """Ajuste de hiperparámetros con Optuna en vez de valores elegidos a mano --
-    validación con las últimas filas como validation set (nunca aleatoria, es
-    serie temporal)."""
-    n_val = max(int(len(X) * 0.15), 24)
-    X_tr, X_val = X.iloc[:-n_val], X.iloc[-n_val:]
-    y_tr, y_val = y.iloc[:-n_val], y.iloc[-n_val:]
+def build_direct_frame(df: pd.DataFrame, target_col: str, feature_cols: list, lag_steps: list,
+                        roll_windows: list, horizon: int, origin_stride: int):
+    lag_roll = _lag_roll_features(df[target_col], lag_steps, roll_windows)
+    lag_roll_names = list(lag_roll.columns)
+    valid = lag_roll.notna().all(axis=1)
+
+    n = len(df)
+    origins = [o for o in range(n - horizon) if valid.iloc[o]][::origin_stride]
+
+    rows = []
+    for o in origins:
+        base = lag_roll.iloc[o].to_dict()
+        for h in range(1, horizon + 1):
+            row = dict(base)
+            row["h"] = h
+            t = o + h
+            for col in feature_cols:
+                row[col] = df[col].iloc[t]
+            row["_target"] = df[target_col].iloc[t]
+            rows.append(row)
+    frame = pd.DataFrame(rows)
+    feature_names = lag_roll_names + ["h"] + feature_cols
+    return frame, feature_names
+
+
+def tune_xgb_params_direct(frame: pd.DataFrame, feature_names: list, n_trials: int = 40) -> dict:
+    """Como un tuning normal de Optuna, pero la validación se separa por ORIGEN
+    (no por fila): todas las filas de un mismo origen (una por cada h) comparten
+    los mismos lags, así que si se mezclaran entre train y validación la
+    validación dejaría de ser honesta -- se valida con los últimos orígenes."""
+    n_h = frame["h"].nunique()
+    n_origins = len(frame) // n_h
+    n_val_origins = max(int(n_origins * 0.15), 3)
+    n_val_rows = n_val_origins * n_h
+
+    frame_tr, frame_val = frame.iloc[:-n_val_rows], frame.iloc[-n_val_rows:]
+    X_tr, y_tr = frame_tr[feature_names], frame_tr["_target"]
+    X_val, y_val = frame_val[feature_names], frame_val["_target"]
 
     def objective(trial):
         params = {
@@ -177,39 +223,35 @@ def tune_xgb_params(X: pd.DataFrame, y: pd.Series, n_trials: int = 40) -> dict:
     return study.best_params
 
 
-def xgb_recursive_forecast(df: pd.DataFrame, target_col: str, horizon: int,
-                            lag_steps: list, roll_windows: list, feature_cols: list,
-                            freq: pd.Timedelta, n_trials: int = 40, fixed_params: dict = None):
+def xgb_direct_forecast(df: pd.DataFrame, target_col: str, horizon: int, lag_steps: list,
+                         roll_windows: list, feature_cols: list, origin_stride: int,
+                         n_trials: int = 40, fixed_params: dict = None):
     """Si se pasa `fixed_params` (los hiperparámetros ya validados y guardados en
     outputs/metrics.json por un entrenamiento previo) se usan directamente y no
     se vuelve a lanzar Optuna -- así es como predict.py sirve predicciones en
     segundos en vez de repetir una búsqueda de 40 pruebas en cada petición."""
     train_df = df.iloc[:-horizon].reset_index(drop=True)
-    frame = build_lagged_frame(train_df, target_col, lag_steps, roll_windows, feature_cols)
-    feature_names = [f"lag_{l}" for l in lag_steps] + [f"roll_{w}" for w in roll_windows] + feature_cols
+    frame, feature_names = build_direct_frame(train_df, target_col, feature_cols, lag_steps,
+                                               roll_windows, horizon, origin_stride)
 
-    best_params = fixed_params or tune_xgb_params(frame[feature_names], frame[target_col], n_trials)
+    best_params = fixed_params or tune_xgb_params_direct(frame, feature_names, n_trials)
     model = xgb.XGBRegressor(**best_params, random_state=42)
-    model.fit(frame[feature_names], frame[target_col])
+    model.fit(frame[feature_names], frame["_target"])
 
-    history = train_df.set_index("datetime")[target_col].copy()
-    future_meta = df.iloc[-horizon:].set_index("datetime")[feature_cols]
-
-    preds = []
-    for t in future_meta.index:
-        row = {}
-        for lag in lag_steps:
-            lag_time = t - lag * freq
-            row[f"lag_{lag}"] = history.get(lag_time, history.iloc[-1])
-        for win in roll_windows:
-            row[f"roll_{win}"] = history.iloc[-win:].mean() if len(history) >= win else history.mean()
+    # Predicción real: un único origen (el último punto de train_df, con datos
+    # 100% reales) y h=1..horizon -- nunca se realimenta una predicción propia.
+    base = _lag_roll_features(train_df[target_col], lag_steps, roll_windows).iloc[-1].to_dict()
+    future_meta = df.iloc[-horizon:].reset_index(drop=True)
+    rows = []
+    for h in range(1, horizon + 1):
+        row = dict(base)
+        row["h"] = h
         for col in feature_cols:
-            row[col] = future_meta.loc[t, col]
-        X = pd.DataFrame([row])[feature_names]
-        pred = float(model.predict(X)[0])
-        preds.append(pred)
-        history.loc[t] = pred
-    return pd.Series(preds, index=future_meta.index), model, feature_names, best_params
+            row[col] = future_meta[col].iloc[h - 1]
+        rows.append(row)
+    preds = model.predict(pd.DataFrame(rows)[feature_names])
+    index = df.iloc[-horizon:].set_index("datetime").index
+    return pd.Series(preds, index=index), model, feature_names, best_params
 
 
 # ---------------------------------------------------------------------------
@@ -324,9 +366,9 @@ def plot_feature_importance(model, feature_names, path: Path, title: str):
 # ---------------------------------------------------------------------------
 
 def run_comparison(df: pd.DataFrame, target_col: str, horizon: int, baseline_season_len: int,
-                    lag_steps: list, roll_windows: list, feature_cols: list, freq: pd.Timedelta,
+                    lag_steps: list, roll_windows: list, feature_cols: list,
                     chronos_pipeline, label: str, ylabel: str, near_far_split: int,
-                    sarimax_max_train: int = None, sarimax_period: int = 7,
+                    origin_stride: int, sarimax_max_train: int = None, sarimax_period: int = 7,
                     sarimax_auto_search: bool = True, sarimax_fixed_order=None,
                     sarimax_fixed_seasonal_order=None, xgb_trials: int = 40) -> dict:
     data_ = df.dropna(subset=[target_col] + feature_cols).reset_index(drop=True)
@@ -362,8 +404,8 @@ def run_comparison(df: pd.DataFrame, target_col: str, horizon: int, baseline_sea
     except Exception as exc:
         print(f"SARIMAX falló ({exc}), se omite de la comparativa.")
 
-    xgb_pred, xgb_model, xgb_features, xgb_params = xgb_recursive_forecast(
-        data_, target_col, horizon, lag_steps, roll_windows, feature_cols, freq, xgb_trials
+    xgb_pred, xgb_model, xgb_features, xgb_params = xgb_direct_forecast(
+        data_, target_col, horizon, lag_steps, roll_windows, feature_cols, origin_stride, xgb_trials
     )
     forecasts["XGBoost"] = xgb_pred.values
     results["XGBoost"] = metrics(actual_holdout, xgb_pred)
@@ -454,9 +496,9 @@ def main():
     all_results["demanda_mwh"] = run_comparison(
         df, "demanda_mwh", horizon=24 * 7, baseline_season_len=24 * 7,
         lag_steps=[24, 48, 168, 336], roll_windows=[24, 168],
-        feature_cols=demand_features, freq=pd.Timedelta(hours=1),
+        feature_cols=demand_features,
         chronos_pipeline=chronos_pipeline, label="Demanda eléctrica (MWh/h)", ylabel="MWh",
-        near_far_split=24, sarimax_max_train=24 * 120, sarimax_auto_search=False,
+        near_far_split=24, origin_stride=24, sarimax_max_train=24 * 120, sarimax_auto_search=False,
         sarimax_fixed_order=(2, 0, 2), sarimax_fixed_seasonal_order=(1, 0, 1, 24),
     )
 
@@ -496,9 +538,9 @@ def main():
     all_results["renewable_pct"] = run_comparison(
         daily, "renewable_pct", horizon=7, baseline_season_len=7,
         lag_steps=lag_steps_renewable, roll_windows=roll_windows_renewable,
-        feature_cols=renewable_features, freq=pd.Timedelta(days=1),
+        feature_cols=renewable_features,
         chronos_pipeline=chronos_pipeline, label="% Generación renovable", ylabel="%",
-        near_far_split=1, sarimax_period=7,
+        near_far_split=1, origin_stride=1, sarimax_period=7,
     )
 
     with open(OUTPUT_DIR / "metrics.json", "w") as fh:

@@ -1,24 +1,24 @@
 {
   "demanda_mwh": {
     "Baseline": {
-      "MAE": 3386.07,
-      "RMSE": 3964.375,
-      "MAPE_%": 10.96,
-      "sMAPE_%": 11.82,
-      "R2": -0.063,
-      "Bias": 3302.064,
-      "MAPE_dia1_%": 3.52,
-      "MAPE_dia7_%": 16.31
+      "MAE": 3211.271,
+      "RMSE": 3811.43,
+      "MAPE_%": 10.37,
+      "sMAPE_%": 11.14,
+      "R2": 0.153,
+      "Bias": 3032.053,
+      "MAPE_dia1_%": 3.74,
+      "MAPE_dia7_%": 13.83
     },
     "SARIMAX": {
-      "MAE": 1843.638,
-      "RMSE": 2338.204,
-      "MAPE_%": 6.14,
-      "sMAPE_%": 6.43,
-      "R2": 0.63,
-      "Bias": 1556.852,
-      "MAPE_dia1_%": 3.12,
-      "MAPE_dia7_%": 4.88,
+      "MAE": 1607.737,
+      "RMSE": 2146.801,
+      "MAPE_%": 5.5,
+      "sMAPE_%": 5.65,
+      "R2": 0.731,
+      "Bias": 872.703,
+      "MAPE_dia1_%": 6.35,
+      "MAPE_dia7_%": 4.45,
       "orden": "(2, 0, 2)x(1, 0, 1, 24)",
       "orden_pdq": [
         2,
@@ -31,77 +31,77 @@
         1,
         24
       ],
-      "mejora_vs_baseline_%": 44.0
+      "mejora_vs_baseline_%": 47.0
     },
     "XGBoost": {
-      "MAE": 2542.572,
-      "RMSE": 2773.942,
-      "MAPE_%": 8.18,
-      "sMAPE_%": 8.59,
-      "R2": 0.48,
-      "Bias": 2542.572,
-      "MAPE_dia1_%": 5.87,
-      "MAPE_dia7_%": 10.93,
+      "MAE": 2235.693,
+      "RMSE": 2577.534,
+      "MAPE_%": 7.1,
+      "sMAPE_%": 7.42,
+      "R2": 0.613,
+      "Bias": 2114.483,
+      "MAPE_dia1_%": 3.33,
+      "MAPE_dia7_%": 5.89,
       "mejores_hiperparametros": {
-        "n_estimators": 396,
-        "max_depth": 7,
-        "learning_rate": 0.07081019571079895,
-        "subsample": 0.9301283722554106,
-        "colsample_bytree": 0.7808298450285533,
-        "min_child_weight": 8,
-        "reg_lambda": 0.10130240987574642
+        "n_estimators": 460,
+        "max_depth": 8,
+        "learning_rate": 0.06636846949586547,
+        "subsample": 0.8275593759635507,
+        "colsample_bytree": 0.727066204238829,
+        "min_child_weight": 9,
+        "reg_lambda": 0.12754436459754778
       },
-      "mejora_vs_baseline_%": 25.4
+      "mejora_vs_baseline_%": 31.5
     },
     "Chronos-2": {
-      "MAE": 2772.188,
-      "RMSE": 3105.129,
-      "MAPE_%": 8.86,
-      "sMAPE_%": 9.36,
-      "R2": 0.348,
-      "Bias": 2772.188,
-      "MAPE_dia1_%": 3.42,
-      "MAPE_dia7_%": 11.98,
-      "mejora_vs_baseline_%": 19.2
+      "MAE": 2648.461,
+      "RMSE": 2991.135,
+      "MAPE_%": 8.45,
+      "sMAPE_%": 8.9,
+      "R2": 0.478,
+      "Bias": 2617.479,
+      "MAPE_dia1_%": 3.8,
+      "MAPE_dia7_%": 10.37,
+      "mejora_vs_baseline_%": 18.5
     },
     "Ensemble": {
-      "MAE": 2290.537,
-      "RMSE": 2530.544,
-      "MAPE_%": 7.37,
-      "sMAPE_%": 7.7,
-      "R2": 0.567,
-      "Bias": 2290.537,
-      "MAPE_dia1_%": 3.81,
-      "MAPE_dia7_%": 7.45,
+      "MAE": 2004.53,
+      "RMSE": 2291.498,
+      "MAPE_%": 6.43,
+      "sMAPE_%": 6.68,
+      "R2": 0.694,
+      "Bias": 1868.222,
+      "MAPE_dia1_%": 3.48,
+      "MAPE_dia7_%": 4.67,
       "compuesto_por": [
         "SARIMAX",
         "XGBoost",
         "Chronos-2"
       ],
-      "mejora_vs_baseline_%": 32.8
+      "mejora_vs_baseline_%": 38.0
     },
     "_campeon": "SARIMAX"
   },
   "renewable_pct": {
     "Baseline": {
-      "MAE": 9.092,
-      "RMSE": 13.176,
-      "MAPE_%": 25.57,
-      "sMAPE_%": 18.98,
-      "R2": -1.333,
-      "Bias": -9.092,
-      "MAPE_dia1_%": 4.37,
-      "MAPE_dia7_%": 114.44
+      "MAE": 4.889,
+      "RMSE": 5.821,
+      "MAPE_%": 9.68,
+      "sMAPE_%": 9.04,
+      "R2": -2.065,
+      "Bias": -4.889,
+      "MAPE_dia1_%": 3.26,
+      "MAPE_dia7_%": 6.56
     },
     "SARIMAX": {
-      "MAE": 7.95,
-      "RMSE": 11.389,
-      "MAPE_%": 22.32,
-      "sMAPE_%": 17.11,
-      "R2": -0.743,
-      "Bias": -7.95,
-      "MAPE_dia1_%": 4.22,
-      "MAPE_dia7_%": 100.5,
+      "MAE": 3.112,
+      "RMSE": 3.605,
+      "MAPE_%": 6.01,
+      "sMAPE_%": 5.87,
+      "R2": -0.176,
+      "Bias": -1.419,
+      "MAPE_dia1_%": 8.03,
+      "MAPE_dia7_%": 7.95,
       "orden": "(2, 1, 1)x(0, 0, 0, 7)",
       "orden_pdq": [
         2,
@@ -114,54 +114,54 @@
         0,
         7
       ],
-      "mejora_vs_baseline_%": 12.7
+      "mejora_vs_baseline_%": 37.9
     },
     "XGBoost": {
-      "MAE": 6.243,
-      "RMSE": 10.297,
-      "MAPE_%": 18.61,
-      "sMAPE_%": 14.05,
-      "R2": -0.424,
-      "Bias": -6.243,
-      "MAPE_dia1_%": 2.94,
-      "MAPE_dia7_%": 95.02,
+      "MAE": 2.694,
+      "RMSE": 3.369,
+      "MAPE_%": 5.26,
+      "sMAPE_%": 5.08,
+      "R2": -0.027,
+      "Bias": -1.843,
+      "MAPE_dia1_%": 5.07,
+      "MAPE_dia7_%": 10.3,
       "mejores_hiperparametros": {
-        "n_estimators": 421,
-        "max_depth": 5,
-        "learning_rate": 0.013854033700280674,
-        "subsample": 0.859389625853192,
-        "colsample_bytree": 0.9626636306758574,
-        "min_child_weight": 3,
-        "reg_lambda": 3.6487455962369597
+        "n_estimators": 582,
+        "max_depth": 8,
+        "learning_rate": 0.020688898070149144,
+        "subsample": 0.6966477009697275,
+        "colsample_bytree": 0.9653291171694196,
+        "min_child_weight": 4,
+        "reg_lambda": 0.4713915095995149
       },
-      "mejora_vs_baseline_%": 27.2
+      "mejora_vs_baseline_%": 45.7
     },
     "Chronos-2": {
-      "MAE": 7.849,
-      "RMSE": 11.569,
-      "MAPE_%": 22.31,
-      "sMAPE_%": 16.91,
-      "R2": -0.798,
-      "Bias": -7.849,
-      "MAPE_dia1_%": 4.79,
-      "MAPE_dia7_%": 103.42,
-      "mejora_vs_baseline_%": 12.7
+      "MAE": 3.183,
+      "RMSE": 3.774,
+      "MAPE_%": 6.25,
+      "sMAPE_%": 6.02,
+      "R2": -0.289,
+      "Bias": -2.281,
+      "MAPE_dia1_%": 5.24,
+      "MAPE_dia7_%": 9.36,
+      "mejora_vs_baseline_%": 35.4
     },
     "Ensemble": {
-      "MAE": 7.347,
-      "RMSE": 11.062,
-      "MAPE_%": 21.08,
-      "sMAPE_%": 16.04,
-      "R2": -0.644,
-      "Bias": -7.347,
-      "MAPE_dia1_%": 3.98,
-      "MAPE_dia7_%": 99.65,
+      "MAE": 2.967,
+      "RMSE": 3.526,
+      "MAPE_%": 5.78,
+      "sMAPE_%": 5.61,
+      "R2": -0.125,
+      "Bias": -1.848,
+      "MAPE_dia1_%": 6.11,
+      "MAPE_dia7_%": 9.2,
       "compuesto_por": [
         "SARIMAX",
         "XGBoost",
         "Chronos-2"
       ],
-      "mejora_vs_baseline_%": 17.6
+      "mejora_vs_baseline_%": 40.3
     },
     "_campeon": "XGBoost"
   }

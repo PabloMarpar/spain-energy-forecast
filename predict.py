@@ -25,9 +25,9 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from data import CACHE_PATH, add_calendar_features, fetch_weather, fetch_marine
+from data import CACHE_PATH, add_calendar_features, fetch_weather, fetch_marine, trim_incomplete_trailing_days
 from train import (
-    OUTPUT_DIR, sarimax_auto_forecast, xgb_recursive_forecast,
+    OUTPUT_DIR, sarimax_auto_forecast, xgb_direct_forecast,
     chronos_covariate_forecast, baseline_seasonal,
 )
 
@@ -35,6 +35,7 @@ DEMAND_FEATURES = ["temperature_2m", "relative_humidity_2m", "shortwave_radiatio
                     "wind_speed_10m", "wind_speed_100m", "is_weekend", "is_holiday"]
 DEMAND_LAGS = [24, 48, 168, 336]
 DEMAND_ROLLS = [24, 168]
+DEMAND_ORIGIN_STRIDE = 24  # un origen por día -- igual que en train.py
 DEMAND_SARIMAX_DEFAULTS = (24, 24 * 120)  # (periodo estacional, ventana de entrenamiento)
 
 RENEWABLE_FEATURES = ["shortwave_radiation", "shortwave_radiation_max", "direct_radiation",
@@ -58,6 +59,7 @@ def load_target_results() -> tuple[dict, dict]:
 def load_history() -> pd.DataFrame:
     df = pd.read_csv(CACHE_PATH, parse_dates=["datetime"])
     df["datetime"] = pd.to_datetime(df["datetime"], utc=True).dt.tz_convert("Europe/Madrid")
+    df = trim_incomplete_trailing_days(df)  # por si el CSV cacheado quedó con el último día a medias
     numeric_cols = df.select_dtypes(include="number").columns.tolist()
     df = df.set_index("datetime").asfreq("h")
     df[numeric_cols] = df[numeric_cols].interpolate(limit=6)
@@ -79,7 +81,7 @@ def fetch_future_weather(horizon_days: int = 7) -> pd.DataFrame:
 
 
 def _forecast_one_model(name: str, combined: pd.DataFrame, target_col: str, horizon: int,
-                         lag_steps: list, roll_windows: list, feature_cols: list, freq: pd.Timedelta,
+                         lag_steps: list, roll_windows: list, feature_cols: list,
                          train_series_full: pd.Series, train_feat: pd.DataFrame, fut_feat: pd.DataFrame,
                          target_results: dict, chronos_pipeline, sarimax_defaults: tuple) -> pd.Series:
     if name == "SARIMAX":
@@ -96,8 +98,10 @@ def _forecast_one_model(name: str, combined: pd.DataFrame, target_col: str, hori
         return pred
     if name == "XGBoost":
         info = target_results.get("XGBoost", {})
-        pred, *_ = xgb_recursive_forecast(combined, target_col, horizon, lag_steps, roll_windows,
-                                           feature_cols, freq, fixed_params=info.get("mejores_hiperparametros"))
+        origin_stride = DEMAND_ORIGIN_STRIDE if target_col == "demanda_mwh" else 1
+        pred, *_ = xgb_direct_forecast(combined, target_col, horizon, lag_steps, roll_windows,
+                                        feature_cols, origin_stride,
+                                        fixed_params=info.get("mejores_hiperparametros"))
         return pred
     if name == "Chronos-2":
         pred = chronos_covariate_forecast(train_series_full, train_feat, fut_feat, horizon, chronos_pipeline)
@@ -106,7 +110,7 @@ def _forecast_one_model(name: str, combined: pd.DataFrame, target_col: str, hori
 
 
 def _forecast_target(target_col: str, combined: pd.DataFrame, horizon: int, lag_steps: list,
-                      roll_windows: list, feature_cols: list, freq: pd.Timedelta,
+                      roll_windows: list, feature_cols: list,
                       train_series_full: pd.Series, train_feat: pd.DataFrame, fut_feat: pd.DataFrame,
                       target_results: dict, chronos_pipeline, sarimax_defaults: tuple,
                       baseline_season_len: int, progress=None, label: str = "") -> pd.Series:
@@ -121,7 +125,7 @@ def _forecast_target(target_col: str, combined: pd.DataFrame, horizon: int, lag_
             progress(f"Prediciendo {label} con {sub}" + (" (parte del ensemble)..." if champion == "Ensemble" else "..."))
         try:
             preds.append(_forecast_one_model(sub, combined, target_col, horizon, lag_steps, roll_windows,
-                                              feature_cols, freq, train_series_full, train_feat, fut_feat,
+                                              feature_cols, train_series_full, train_feat, fut_feat,
                                               target_results, chronos_pipeline, sarimax_defaults))
         except Exception as exc:
             print(f"{sub} falló en predicción en vivo ({exc}), se omite.")
@@ -143,7 +147,7 @@ def forecast_demand(history: pd.DataFrame, future_weather: pd.DataFrame, target_
         [history[["datetime", "demanda_mwh"] + DEMAND_FEATURES], future_part], ignore_index=True
     )
     return _forecast_target(
-        "demanda_mwh", combined, horizon, DEMAND_LAGS, DEMAND_ROLLS, DEMAND_FEATURES, pd.Timedelta(hours=1),
+        "demanda_mwh", combined, horizon, DEMAND_LAGS, DEMAND_ROLLS, DEMAND_FEATURES,
         history.set_index("datetime")["demanda_mwh"], history[["datetime"] + DEMAND_FEATURES],
         future_weather[["datetime"] + DEMAND_FEATURES], target_results, chronos_pipeline,
         DEMAND_SARIMAX_DEFAULTS, 24 * 7, progress, "demanda",
@@ -161,7 +165,7 @@ def forecast_renewable(history_daily: pd.DataFrame, future_daily: pd.DataFrame, 
     lag_steps = [1, 7, 14, 30, 365] if len(history_daily) > 400 else [1, 7, 14]
     roll_windows = [7, 30] if len(history_daily) > 400 else [7]
     return _forecast_target(
-        "renewable_pct", combined, horizon, lag_steps, roll_windows, RENEWABLE_FEATURES, pd.Timedelta(days=1),
+        "renewable_pct", combined, horizon, lag_steps, roll_windows, RENEWABLE_FEATURES,
         history_daily.set_index("datetime")["renewable_pct"], history_daily[["datetime"] + RENEWABLE_FEATURES],
         future_daily[["datetime"] + RENEWABLE_FEATURES], target_results, chronos_pipeline,
         RENEWABLE_SARIMAX_DEFAULTS, 7, progress, "% renovable",

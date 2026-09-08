@@ -276,6 +276,29 @@ def add_calendar_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def trim_incomplete_trailing_days(df: pd.DataFrame, min_hours: int = 20,
+                                   check_cols: tuple = ("demanda_mwh",)) -> pd.DataFrame:
+    """Descubierto en vivo: `data.py` pide datos hasta "ayer" (`date.today() - 1`),
+    pero REE no siempre tiene el día anterior completo cuando se descarga -- a
+    veces solo hay 1-2 horas publicadas. Ese día a medias no sale como NaN (que
+    se filtraría solo): sale con un valor real pero calculado sobre casi ninguna
+    hora, lo que contamina tanto el entrenamiento como, si cae dentro del
+    holdout de evaluación, la propia "verdad" contra la que se mide cada modelo
+    (así fue como se detectó: un "desplome" de % renovable a final del holdout
+    que en realidad era un día con 1 sola hora de demanda publicada). Se recortan
+    del final los días que no lleguen a `min_hours` horas reales en ninguna de
+    `check_cols`."""
+    dates = sorted(df["datetime"].dt.date.unique())
+    while dates:
+        day_mask = df["datetime"].dt.date == dates[-1]
+        if all(df.loc[day_mask, c].notna().sum() >= min_hours for c in check_cols):
+            break
+        dates.pop()
+    if not dates:
+        return df
+    return df[df["datetime"].dt.date <= dates[-1]].reset_index(drop=True)
+
+
 def build_dataset(start: date, end: date, forecast_days: int = None) -> pd.DataFrame:
     print(f"Descargando demanda REE ({start} a {end})...")
     demanda = fetch_ree_demanda(start, end) if forecast_days is None else pd.DataFrame()
@@ -297,6 +320,12 @@ def build_dataset(start: date, end: date, forecast_days: int = None) -> pd.DataF
         df = df.merge(generacion, left_on="date_str", right_on="date", how="left").drop(columns=["date_str", "date"])
 
     df = add_calendar_features(df)
+    if forecast_days is None:
+        before = df["datetime"].dt.date.nunique()
+        df = trim_incomplete_trailing_days(df)
+        after = df["datetime"].dt.date.nunique()
+        if after < before:
+            print(f"  recortados {before - after} día(s) incompletos al final (REE aún no los había publicado del todo)")
     return df
 
 
