@@ -126,10 +126,13 @@ def metrics_table(target_results: dict) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def line_chart(x, series_dict: dict, title: str, ylabel: str, hidden: set = frozenset()) -> go.Figure:
+def line_chart(x, series_dict: dict, ylabel: str, hidden: set = frozenset()) -> go.Figure:
     """`hidden`: nombres de serie que arrancan ocultas (clic en la leyenda para
     mostrarlas) -- por defecto se muestran real + baseline + el campeón, y el
-    resto queda disponible pero oculto para no saturar la gráfica de entrada."""
+    resto queda disponible pero oculto para no saturar la gráfica de entrada.
+    El título se pinta con `chart_title` (un `st.markdown` fuera de la figura),
+    no con el `title` de Plotly -- con leyendas de varias líneas en pantallas
+    estrechas, el título interno de Plotly podía acabar solapado con la leyenda."""
     fig = go.Figure()
     for name, y in series_dict.items():
         style = dict(color=COLORS.get(name, "#c9c9c9"), width=3 if name == "real" else 2.2)
@@ -140,16 +143,22 @@ def line_chart(x, series_dict: dict, title: str, ylabel: str, hidden: set = froz
             visible="legendonly" if name in hidden else True,
         ))
     fig.update_layout(
-        title=title, yaxis_title=ylabel, hovermode="x unified", template="plotly_dark",
+        yaxis_title=ylabel, hovermode="x unified", template="plotly_dark",
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-        legend=dict(orientation="h", y=1.12), margin=dict(t=60, l=10, r=10), height=440,
+        legend=dict(orientation="h", y=1.15), margin=dict(t=40, l=10, r=10), height=420,
     )
     fig.update_xaxes(showgrid=False)
     fig.update_yaxes(gridcolor="rgba(255,255,255,0.08)")
     return fig
 
 
-def stacked_generation_chart(view: pd.DataFrame, title: str) -> go.Figure:
+def chart_title(title: str) -> None:
+    """Título de gráfica pintado con Streamlit, no con el `title` interno de
+    Plotly -- ver la nota en `line_chart`."""
+    st.markdown(f"###### {title}")
+
+
+def stacked_generation_chart(view: pd.DataFrame) -> go.Figure:
     daily = view.groupby(view["datetime"].dt.date).first(numeric_only=True).reset_index()
     fig = go.Figure()
     for bucket, cols in TECH_BUCKETS.items():
@@ -163,9 +172,9 @@ def stacked_generation_chart(view: pd.DataFrame, title: str) -> go.Figure:
             fillcolor=BUCKET_COLORS.get(bucket, "#888"),
         ))
     fig.update_layout(
-        title=title, yaxis_title="% del mix de generación", hovermode="x unified", template="plotly_dark",
+        yaxis_title="% del mix de generación", hovermode="x unified", template="plotly_dark",
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-        legend=dict(orientation="h", y=1.15), margin=dict(t=60, l=10, r=10), height=460,
+        legend=dict(orientation="h", y=1.2), margin=dict(t=50, l=10, r=10), height=460,
     )
     fig.update_xaxes(showgrid=False)
     fig.update_yaxes(gridcolor="rgba(255,255,255,0.08)", range=[0, 100])
@@ -202,7 +211,7 @@ with tab_historico:
     st.subheader("Explora el histórico")
     col1, col2 = st.columns([1, 3])
     with col1:
-        variable = st.radio("Variable", ["Demanda eléctrica (MWh)", "Mix de generación (% renovable)"])
+        variable = st.radio("Variable", ["Mix de generación (% renovable)", "Demanda eléctrica (MWh)"])
         min_d, max_d = history["datetime"].min().date(), history["datetime"].max().date()
         default_start = max_d.replace(year=max_d.year - 1)
         date_range = st.slider("Rango de fechas", min_value=min_d, max_value=max_d,
@@ -211,15 +220,16 @@ with tab_historico:
     view = history.loc[mask]
     with col2:
         if variable.startswith("Demanda"):
-            fig = line_chart(view["datetime"], {"real": view["demanda_mwh"]},
-                              "Demanda eléctrica horaria", "MWh")
+            chart_title("Demanda eléctrica horaria")
+            fig = line_chart(view["datetime"], {"real": view["demanda_mwh"]}, "MWh")
             st.plotly_chart(fig, use_container_width=True)
         else:
-            fig = stacked_generation_chart(view, "Mix de generación eléctrica por tecnología (% diario)")
+            chart_title("Mix de generación eléctrica por tecnología (% diario)")
+            fig = stacked_generation_chart(view)
             st.plotly_chart(fig, use_container_width=True)
             daily_view = view.groupby(view["datetime"].dt.date)["renewable_pct"].first().reset_index()
-            fig2 = line_chart(daily_view["datetime"], {"real": daily_view["renewable_pct"]},
-                               "% total de generación renovable (solar + eólica + hidráulica + otras)", "%")
+            chart_title("% total de generación renovable (solar + eólica + hidráulica + otras)")
+            fig2 = line_chart(daily_view["datetime"], {"real": daily_view["renewable_pct"]}, "%")
             st.plotly_chart(fig2, use_container_width=True)
     st.caption(f"Datos desde {min_d} hasta {max_d} -- {len(history):,} filas horarias.".replace(",", "."))
 
@@ -243,10 +253,9 @@ with tab_modelos:
         series_dict = {c: holdout[c] for c in holdout.columns if c != "datetime"}
         non_priority = {"real", "Baseline", champion}
         hidden = {name for name in series_dict if name not in non_priority}
-        fig = line_chart(holdout["datetime"], series_dict,
-                          f"{label}: real vs. predicción (últimos 7 días, holdout de evaluación) -- "
-                          "clic en la leyenda para mostrar/ocultar modelos",
-                          ylabel, hidden=hidden)
+        chart_title(f"{label}: real vs. predicción (últimos 7 días, holdout de evaluación) -- "
+                    "clic en la leyenda para mostrar/ocultar modelos")
+        fig = line_chart(holdout["datetime"], series_dict, ylabel, hidden=hidden)
         st.plotly_chart(fig, use_container_width=True)
 
         importancia_path = OUTPUT_DIR / f"{target_col}_importancia.png"
@@ -375,16 +384,12 @@ punto de la gráfica y se ve de un vistazo cómo ha ido acertando la predicción
         renovable_pred_s = renovable_fut_full.set_index("date_dt")["pct"].reindex(full_days)
         renovable_real_s = renovable_real.reindex(full_days)
 
-        fig_d = line_chart(
-            full_hours,
-            {"real": demanda_real_s, "predicción": demanda_pred_s},
-            "Demanda eléctrica: últimos 3 días + predicción a lo que queda de horizonte", "MWh")
+        chart_title("Demanda eléctrica: últimos 3 días + predicción a lo que queda de horizonte")
+        fig_d = line_chart(full_hours, {"real": demanda_real_s, "predicción": demanda_pred_s}, "MWh")
         st.plotly_chart(fig_d, use_container_width=True)
 
-        fig_r = line_chart(
-            full_days,
-            {"real": renovable_real_s, "predicción": renovable_pred_s},
-            "% de generación renovable: últimos 3 días + predicción", "%")
+        chart_title("% de generación renovable: últimos 3 días + predicción")
+        fig_r = line_chart(full_days, {"real": renovable_real_s, "predicción": renovable_pred_s}, "%")
         st.plotly_chart(fig_r, use_container_width=True)
 
         mape_demanda = _elapsed_mape(demanda_pred_s, demanda_real_s)
@@ -414,10 +419,11 @@ punto de la gráfica y se ve de un vistazo cómo ha ido acertando la predicción
                     fig_tech.add_trace(go.Bar(x=tech_df["date"], y=tech_df[col], name=label,
                                                marker_color=BUCKET_COLORS.get(label)))
             fig_tech.update_layout(
-                barmode="stack", title="% renovable previsto, por tecnología", yaxis_title="%",
+                barmode="stack", yaxis_title="%",
                 template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                legend=dict(orientation="h", y=1.12), margin=dict(t=60, l=10, r=10), height=420,
+                legend=dict(orientation="h", y=1.15), margin=dict(t=40, l=10, r=10), height=420,
             )
+            chart_title("% renovable previsto, por tecnología")
             st.plotly_chart(fig_tech, use_container_width=True)
 
 # ---------------------------------------------------------------------------
