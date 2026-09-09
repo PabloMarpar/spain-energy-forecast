@@ -93,6 +93,78 @@ def fetch_future_weather(horizon_days: int = 7) -> pd.DataFrame:
     return future
 
 
+def fetch_retro_weather(start, end) -> pd.DataFrame:
+    """Igual que `fetch_future_weather`, pero para un tramo YA PASADO -- usa el
+    archivo histórico de Open-Meteo (el clima que de verdad ocurrió, no una
+    previsión) para poder reconstruir qué habría predicho el modelo campeón en
+    esos días con datos reales, y así comparar predicho contra real también en
+    los días recién pasados, no solo enseñar el histórico sin más."""
+    weather = fetch_weather(start=start, end=end)
+    marine = fetch_marine(start=start, end=end)
+    wind_regions = fetch_wind_regions(start=start, end=end)
+    demand_climate = fetch_demand_climate(start=start, end=end)
+    retro = (weather.merge(marine, on="datetime", how="left")
+             .merge(wind_regions, on="datetime", how="left")
+             .merge(demand_climate, on="datetime", how="left"))
+    retro = add_calendar_features(retro)
+    retro["hour_sin"] = np.sin(2 * np.pi * retro["hour"] / 24)
+    retro["hour_cos"] = np.cos(2 * np.pi * retro["hour"] / 24)
+    return retro
+
+
+def build_retro_forecast(history: pd.DataFrame, demand_results: dict, renewable_results: dict,
+                          chronos_pipeline, retro_days: int = 3, progress=None) -> dict:
+    """Relanza el modelo campeón como si "hoy" fuera hace `retro_days` días,
+    alimentándolo con el clima que de verdad ocurrió desde entonces (no una
+    previsión) -- reutilizando siempre los mismos hiperparámetros/orden ya
+    validados, igual que la predicción hacia delante. Sirve para poder
+    enseñar en la app predicho Y real en los días recién pasados, no solo el
+    real -- sin esto, para esos días no hay ninguna predicción guardada de
+    ninguna corrida anterior."""
+    def _p(msg):
+        if progress:
+            progress(msg)
+
+    empty = {"demanda_mwh": [], "renovable_pct": []}
+    today = pd.Timestamp.now(tz="Europe/Madrid").normalize()
+    retro_start = (today - pd.Timedelta(days=retro_days)).date()
+    if retro_start >= today.date():
+        return empty
+
+    _p(f"Reconstruyendo qué habría predicho el modelo desde el {retro_start} (clima real, no previsto)...")
+    try:
+        retro_hourly = fetch_retro_weather(retro_start, today.date())
+    except Exception as exc:
+        print(f"No se pudo traer el clima real de los últimos {retro_days} días ({exc}), se omite el retro.")
+        return empty
+    if retro_hourly.empty:
+        return empty
+
+    history_retro = history[history["datetime"] < pd.Timestamp(retro_start, tz="Europe/Madrid")]
+
+    demand_pred_retro, _ = forecast_demand(history_retro, retro_hourly, demand_results, chronos_pipeline, _p)
+
+    history_daily_retro = aggregate_daily_history(history_retro)
+    retro_daily = aggregate_daily(retro_hourly)
+    if renewable_results["_campeon"] == "XGBoost (descompuesto)":
+        tech_breakdown_retro = forecast_technology_breakdown(
+            history_daily_retro, retro_daily, renewable_results, _p)
+        ref_index = next(iter(tech_breakdown_retro.values())).index
+        renewable_pred_retro = pd.Series(
+            np.sum([np.asarray(p.reindex(ref_index)) for p in tech_breakdown_retro.values()], axis=0),
+            index=ref_index,
+        )
+    else:
+        renewable_pred_retro, _ = forecast_renewable(
+            history_daily_retro, retro_daily, renewable_results, chronos_pipeline, _p)
+
+    return {
+        "demanda_mwh": [{"datetime": str(t), "mwh": round(float(v), 1)} for t, v in demand_pred_retro.items()],
+        "renovable_pct": [{"date": str(t.date() if hasattr(t, "date") else t), "pct": round(float(v), 1)}
+                           for t, v in renewable_pred_retro.items()],
+    }
+
+
 def _forecast_one_model(name: str, combined: pd.DataFrame, target_col: str, horizon: int,
                          lag_steps: list, roll_windows: list, feature_cols: list,
                          train_series_full: pd.Series, train_feat: pd.DataFrame, fut_feat: pd.DataFrame,
@@ -312,6 +384,13 @@ def build_forecast(progress=None) -> dict:
 
     demand_pred, demand_model_used = forecast_demand(history, future_hourly, demand_results, chronos_pipeline, _p)
 
+    try:
+        retro = build_retro_forecast(history, demand_results, renewable_results, chronos_pipeline,
+                                      retro_days=3, progress=_p)
+    except Exception as exc:
+        _p(f"No se pudo reconstruir el retrospectivo de los últimos días ({exc}), se omite.")
+        retro = {"demanda_mwh": [], "renovable_pct": []}
+
     history_daily = aggregate_daily_history(history)
     future_daily = aggregate_daily(future_hourly)
     tech_breakdown = forecast_technology_breakdown(history_daily, future_daily, renewable_results, _p)
@@ -349,6 +428,8 @@ def build_forecast(progress=None) -> dict:
         "demanda_mwh": [{"datetime": str(t), "mwh": round(float(v), 1)} for t, v in demand_pred.items()],
         "renovable_pct": [{"date": str(t.date() if hasattr(t, "date") else t), "pct": round(float(v), 1)}
                            for t, v in renewable_pred.items()],
+        "retro_demanda_mwh": retro["demanda_mwh"],
+        "retro_renovable_pct": retro["renovable_pct"],
         "resumen_diario": daily_summary,
         "desglose_tecnologia": [
             {"date": str(future_daily["datetime"].dt.date.iloc[i]),

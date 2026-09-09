@@ -279,11 +279,13 @@ with tab_vivo:
 Esta sección **recalcula la predicción bajo demanda**, combinando el histórico real más
 reciente con la previsión meteorológica real de Open-Meteo para los próximos 7 días
 (no es un stream continuo -- de ahí las comillas en "tiempo real": se genera cuando se
-pulsa el botón, tarda entre 30 segundos y 2 minutos según qué modelo toque cargar, y se
-cachea unas horas para no repetir el cálculo en cada visita). Las gráficas siempre
-muestran los **3 últimos días reales** (publicados por REE) antes de hoy, para poder
-ver cómo ha ido la predicción justo antes de la fecha actual, seguidos de lo que quede
-del horizonte por delante -- así "hoy" cae siempre en el mismo punto de la gráfica.
+pulsa el botón, tarda entre 1 y 3 minutos según qué modelo toque cargar, y se cachea
+unas horas para no repetir el cálculo en cada visita). Las gráficas siempre muestran
+los **3 últimos días** antes de hoy con **predicho y real a la vez** -- para esos días
+no hay ninguna predicción guardada de antes, así que se reconstruye relanzando el
+modelo campeón con el clima que de verdad ocurrió desde entonces (no una previsión) --
+seguidos de lo que quede del horizonte por delante. Así "hoy" cae siempre en el mismo
+punto de la gráfica y se ve de un vistazo cómo ha ido acertando la predicción.
 """
     )
     cached = load_cached_forecast()
@@ -326,6 +328,28 @@ del horizonte por delante -- así "hoy" cae siempre en el mismo punto de la grá
             demanda_fut_full["datetime"], utc=True).dt.tz_convert("Europe/Madrid")
         renovable_fut_full = pd.DataFrame(forecast["renovable_pct"])
         renovable_fut_full["date_dt"] = pd.to_datetime(renovable_fut_full["date"])
+
+        # Para los días ya pasados no hay ninguna predicción guardada de una
+        # corrida anterior -- se rellenan con el "retrospectivo" que calcula
+        # predict.py (relanza el modelo campeón con el clima real ya ocurrido
+        # desde entonces), para poder ver predicho Y real también ahí, no solo
+        # el real. Los forecasts guardados antes de que existiera este campo
+        # simplemente no lo tienen (`.get(..., [])`), y se degrada sin más.
+        retro_demanda = pd.DataFrame(forecast.get("retro_demanda_mwh", []))
+        if not retro_demanda.empty:
+            retro_demanda["datetime"] = pd.to_datetime(
+                retro_demanda["datetime"], utc=True).dt.tz_convert("Europe/Madrid")
+            demanda_fut_full = pd.concat(
+                [retro_demanda[retro_demanda["datetime"] < demanda_fut_full["datetime"].min()], demanda_fut_full],
+                ignore_index=True)
+
+        retro_renovable = pd.DataFrame(forecast.get("retro_renovable_pct", []))
+        if not retro_renovable.empty:
+            retro_renovable["date_dt"] = pd.to_datetime(retro_renovable["date"])
+            renovable_fut_full = pd.concat(
+                [retro_renovable[retro_renovable["date_dt"] < renovable_fut_full["date_dt"].min()],
+                 renovable_fut_full],
+                ignore_index=True)
 
         # Eje anclado en "hoy": se fijan siempre 3 días hacia atrás (para ver cómo
         # ha ido la predicción justo antes de hoy) y todo lo que quede del
