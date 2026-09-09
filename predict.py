@@ -27,26 +27,30 @@ import pandas as pd
 
 from data import (
     CACHE_PATH, add_calendar_features, fetch_weather, fetch_marine, fetch_wind_regions,
-    trim_incomplete_trailing_days,
+    fetch_demand_climate, trim_incomplete_trailing_days,
 )
 from train import (
-    OUTPUT_DIR, sarimax_auto_forecast, xgb_direct_forecast,
+    OUTPUT_DIR, sarimax_auto_forecast, xgb_direct_forecast, gru_direct_forecast,
     chronos_covariate_forecast, baseline_seasonal, SUB_RENEWABLE_TARGETS,
 )
 
 DEMAND_FEATURES = ["temperature_2m", "relative_humidity_2m", "shortwave_radiation",
-                    "wind_speed_10m", "wind_speed_100m", "is_weekend", "is_holiday"]
+                    "wind_speed_10m", "wind_speed_100m", "is_weekend", "is_holiday",
+                    "temperature_national", "humidity_national", "hdd", "cdd",
+                    "regional_holiday_pct", "precio_lag_24", "precio_lag_168"]
 DEMAND_LAGS = [24, 48, 168, 336]
 DEMAND_ROLLS = [24, 168]
 DEMAND_ORIGIN_STRIDE = 24  # un origen por día -- igual que en train.py
+DEMAND_GRU_WINDOW = 24 * 14
 DEMAND_SARIMAX_DEFAULTS = (24, 24 * 120)  # (periodo estacional, ventana de entrenamiento)
+RENEWABLE_GRU_WINDOW = 60
 
 RENEWABLE_FEATURES = ["shortwave_radiation", "shortwave_radiation_max", "direct_radiation",
                        "cloud_cover", "wind_speed_10m", "wind_speed_10m_max",
                        "wind_speed_100m", "wind_speed_100m_max",
                        "wind_national_mean_100m", "wind_national_max_100m", "wind_national_std_100m",
                        "wind_power_proxy", "wind_power_proxy_max", "precipitation",
-                       "surface_pressure", "wave_height", "doy_sin", "doy_cos",
+                       "surface_pressure", "doy_sin", "doy_cos",
                        "is_weekend", "is_holiday"]
 RENEWABLE_SARIMAX_DEFAULTS = (7, None)
 
@@ -79,7 +83,10 @@ def fetch_future_weather(horizon_days: int = 7) -> pd.DataFrame:
     weather = fetch_weather(forecast_days=horizon_days)
     marine = fetch_marine(forecast_days=horizon_days)
     wind_regions = fetch_wind_regions(forecast_days=horizon_days)
-    future = weather.merge(marine, on="datetime", how="left").merge(wind_regions, on="datetime", how="left")
+    demand_climate = fetch_demand_climate(forecast_days=horizon_days)
+    future = (weather.merge(marine, on="datetime", how="left")
+              .merge(wind_regions, on="datetime", how="left")
+              .merge(demand_climate, on="datetime", how="left"))
     future = add_calendar_features(future)
     future["hour_sin"] = np.sin(2 * np.pi * future["hour"] / 24)
     future["hour_cos"] = np.cos(2 * np.pi * future["hour"] / 24)
@@ -108,6 +115,13 @@ def _forecast_one_model(name: str, combined: pd.DataFrame, target_col: str, hori
         pred, *_ = xgb_direct_forecast(combined, target_col, horizon, lag_steps, roll_windows,
                                         feature_cols, origin_stride,
                                         fixed_params=info.get("mejores_hiperparametros"))
+        return pred
+    if name == "GRU":
+        info = target_results.get("GRU", {})
+        window = DEMAND_GRU_WINDOW if target_col == "demanda_mwh" else RENEWABLE_GRU_WINDOW
+        origin_stride = DEMAND_ORIGIN_STRIDE if target_col == "demanda_mwh" else 1
+        pred, *_ = gru_direct_forecast(combined, target_col, horizon, feature_cols, window,
+                                        origin_stride=origin_stride, fixed_stats=info.get("stats_normalizacion"))
         return pred
     if name == "Chronos-2":
         pred = chronos_covariate_forecast(train_series_full, train_feat, fut_feat, horizon, chronos_pipeline)
@@ -150,16 +164,29 @@ def _forecast_target(target_col: str, combined: pd.DataFrame, horizon: int, lag_
 def forecast_demand(history: pd.DataFrame, future_weather: pd.DataFrame, target_results: dict,
                      chronos_pipeline, progress=None) -> tuple:
     horizon = len(future_weather)
-    future_part = future_weather[["datetime"] + DEMAND_FEATURES].copy()
+    base_cols = [c for c in DEMAND_FEATURES if c not in ("precio_lag_24", "precio_lag_168")]
+    future_part = future_weather[["datetime"] + base_cols].copy()
     future_part["demanda_mwh"] = np.nan
+    future_part["precio_eur_mwh"] = np.nan
     combined = pd.concat(
-        [history[["datetime", "demanda_mwh"] + DEMAND_FEATURES], future_part], ignore_index=True
+        [history[["datetime", "demanda_mwh", "precio_eur_mwh"] + base_cols], future_part], ignore_index=True
     )
+    # El precio real futuro no se conoce en producción más allá de un día
+    # (mercado diario) -- se rellena hacia delante con el último precio real
+    # conocido, solo para que los *lags* tengan un valor en todo el horizonte;
+    # nunca se trata como si fuera el precio futuro real.
+    combined["precio_eur_mwh"] = combined["precio_eur_mwh"].ffill()
+    combined["precio_lag_24"] = combined["precio_eur_mwh"].shift(24)
+    combined["precio_lag_168"] = combined["precio_eur_mwh"].shift(168)
+    combined = combined[["datetime", "demanda_mwh"] + DEMAND_FEATURES]
+
+    train_feat = combined.iloc[:len(history)][["datetime"] + DEMAND_FEATURES]
+    fut_feat = combined.iloc[len(history):][["datetime"] + DEMAND_FEATURES].reset_index(drop=True)
+
     return _forecast_target(
         "demanda_mwh", combined, horizon, DEMAND_LAGS, DEMAND_ROLLS, DEMAND_FEATURES,
-        history.set_index("datetime")["demanda_mwh"], history[["datetime"] + DEMAND_FEATURES],
-        future_weather[["datetime"] + DEMAND_FEATURES], target_results, chronos_pipeline,
-        DEMAND_SARIMAX_DEFAULTS, 24 * 7, progress, "demanda",
+        history.set_index("datetime")["demanda_mwh"], train_feat, fut_feat,
+        target_results, chronos_pipeline, DEMAND_SARIMAX_DEFAULTS, 24 * 7, progress, "demanda",
     )
 
 

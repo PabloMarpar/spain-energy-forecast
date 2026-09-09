@@ -43,6 +43,32 @@ WIND_REGIONS = {
     "galicia": (43.36, -8.41),
 }
 
+# La demanda nacional tampoco depende solo de Madrid -- son las 5 áreas
+# metropolitanas más pobladas, ponderadas por población aproximada (fuente:
+# cifras de población por provincia/comunidad, redondeadas) para que Madrid y
+# Barcelona pesen lo que de verdad pesan en el consumo eléctrico nacional y
+# Bilbao no cuente lo mismo que ellas.
+DEMAND_CITIES = {
+    "madrid": (40.4168, -3.7038, 6_700_000),
+    "barcelona": (41.3851, 2.1734, 5_700_000),
+    "valencia": (39.4699, -0.3763, 2_600_000),
+    "sevilla": (37.3891, -5.9845, 1_950_000),
+    "bilbao": (43.2630, -2.9350, 1_150_000),
+}
+_DEMAND_POP_TOTAL = sum(pop for _, _, pop in DEMAND_CITIES.values())
+
+REE_PRECIO_URL = "https://apidatos.ree.es/es/datos/mercados/precios-mercados-tiempo-real"
+
+# Población aproximada por comunidad autónoma (millones, redondeado) -- para
+# ponderar qué fracción del país está de fiesta regional un día dado, en vez de
+# tratar un festivo autonómico pequeño igual que uno nacional.
+SPAIN_REGION_POPULATION = {
+    "AN": 8.5, "CT": 7.7, "MD": 6.7, "VC": 5.1, "GA": 2.7, "CL": 2.4, "PV": 2.2,
+    "CN": 2.2, "CM": 2.0, "MC": 1.5, "AR": 1.3, "IB": 1.2, "EX": 1.05, "AS": 1.0,
+    "NC": 0.66, "CB": 0.58, "RI": 0.32,
+}
+_REGION_POP_TOTAL = sum(SPAIN_REGION_POPULATION.values())
+
 RENEWABLE_KEYWORDS = ["solar", "eólic", "eolic", "hidrául", "hidraul", "hidroeólica", "renovable", "geotérmica"]
 
 # Nombre de tecnología (tal cual lo da REE) -> columna corta, para poder guardar el
@@ -305,14 +331,104 @@ def fetch_wind_regions(start: date = None, end: date = None, forecast_days: int 
     return out.reset_index()
 
 
+def fetch_demand_climate(start: date = None, end: date = None, forecast_days: int = None) -> pd.DataFrame:
+    """Temperatura ponderada por población de las 5 áreas metropolitanas más
+    grandes de España, no solo Madrid -- mismo razonamiento que con el viento:
+    la demanda nacional depende de cuánto frío/calor hace donde vive la gente
+    de verdad, no en un único punto arbitrario. De la temperatura ponderada se
+    derivan HDD/CDD (grados-día de calefacción/refrigeración): `HDD = max(0,
+    18-T)`, `CDD = max(0, T-18)`, el estándar del sector para modelar demanda
+    sensible al clima -- representan directamente "cuánta calefacción/aire
+    acondicionado hace falta" y capturan el doble pico anual de España (verano
+    por AC, invierno por calefacción) mucho mejor que la temperatura en bruto
+    o que un único seno/coseno anual (que solo tiene un pico, no dos)."""
+    url = METEO_FORECAST_URL if forecast_days else METEO_ARCHIVE_URL
+    per_city = []
+    for name, (lat, lon, _pop) in DEMAND_CITIES.items():
+        city_df = _fetch_open_meteo(url, lat, lon, "temperature_2m,relative_humidity_2m",
+                                     start, end, forecast_days)
+        city_df = city_df.rename(columns={"temperature_2m": f"temp_{name}",
+                                           "relative_humidity_2m": f"rh_{name}"})
+        per_city.append(city_df.set_index("datetime"))
+        time.sleep(0.5)
+    merged = pd.concat(per_city, axis=1, join="inner")
+    out = pd.DataFrame(index=merged.index)
+    temp_national = sum(merged[f"temp_{name}"] * pop for name, (_, _, pop) in DEMAND_CITIES.items()) / _DEMAND_POP_TOTAL
+    rh_national = sum(merged[f"rh_{name}"] * pop for name, (_, _, pop) in DEMAND_CITIES.items()) / _DEMAND_POP_TOTAL
+    out["temperature_national"] = temp_national
+    out["humidity_national"] = rh_national
+    out["hdd"] = (18 - temp_national).clip(lower=0)
+    out["cdd"] = (temp_national - 18).clip(lower=0)
+    return out.reset_index()
+
+
+def fetch_ree_price(start: date, end: date) -> pd.DataFrame:
+    """Precio spot horario del mercado eléctrico (REE apidatos, sin token --
+    endpoint distinto al de generación, no tiene el límite de 14 días de los
+    otros). Variable exploratoria: la relación con la demanda es más
+    "consecuencia" que "causa" (el precio sube cuando la demanda ya es alta,
+    no al revés), así que aquí solo se usa como *lag* (precio de ayer, de hace
+    una semana) -- nunca como "precio futuro conocido", porque en producción
+    el precio del día siguiente en adelante no se conoce con certeza más allá
+    de un día (mercado diario), y usar el precio real futuro del holdout como
+    si se conociera de antemano sería una fuga de información sutil."""
+    rows = []
+    pending = list(_date_chunks(start, end))
+    for _pass in range(2):
+        still_pending = []
+        for chunk_start, chunk_end in pending:
+            params = {"start_date": f"{chunk_start}T00:00", "end_date": f"{chunk_end}T00:00",
+                      "time_trunc": "hour"}
+            data = _get_ree(REE_PRECIO_URL, params)
+            if data is None:
+                still_pending.append((chunk_start, chunk_end))
+                continue
+            for serie in data["included"]:
+                if "spot" not in serie.get("type", "").lower():
+                    continue
+                for v in serie["attributes"]["values"]:
+                    rows.append({"datetime": v["datetime"], "precio_eur_mwh": v["value"]})
+            time.sleep(1.0)
+        pending = still_pending
+        if not pending:
+            break
+        time.sleep(20)
+    if pending:
+        print(f"  aviso: {len(pending)} tramos de precio no se pudieron descargar: {pending}")
+    df = pd.DataFrame(rows)
+    df["datetime"] = pd.to_datetime(df["datetime"], utc=True).dt.tz_convert("Europe/Madrid")
+    return df.drop_duplicates("datetime").sort_values("datetime").reset_index(drop=True)
+
+
+def _regional_holiday_weight_map(years) -> dict:
+    """% de la población española de fiesta autonómica cada día -- una fiesta en
+    La Rioja (0.6% de la población) no debería pesar igual que una en Andalucía
+    o Cataluña (18% y 16%). Se calcula una vez por rango de años (cachear años
+    repetidos sería una micro-optimización que no hace falta a este tamaño)."""
+    weight_by_date = {}
+    for region, pop in SPAIN_REGION_POPULATION.items():
+        try:
+            region_holidays = holidays.Spain(years=years, subdiv=region)
+        except NotImplementedError:
+            continue
+        weight = pop / _REGION_POP_TOTAL
+        for d in region_holidays:
+            weight_by_date[d] = weight_by_date.get(d, 0.0) + weight
+    return weight_by_date
+
+
 def add_calendar_features(df: pd.DataFrame) -> pd.DataFrame:
     years = range(df["datetime"].dt.year.min(), df["datetime"].dt.year.max() + 1)
     es_holidays = holidays.Spain(years=years)
+    regional_weight = _regional_holiday_weight_map(years)
     df["hour"] = df["datetime"].dt.hour
     df["dayofweek"] = df["datetime"].dt.dayofweek
     df["month"] = df["datetime"].dt.month
     df["is_weekend"] = df["dayofweek"].isin([5, 6]).astype(int)
     df["is_holiday"] = df["datetime"].dt.date.astype("O").apply(lambda d: d in es_holidays).astype(int)
+    df["regional_holiday_pct"] = (
+        df["datetime"].dt.date.astype("O").apply(lambda d: regional_weight.get(d, 0.0)) * 100
+    )
     # Ciclo anual como seno/coseno (día 365 y día 1 quedan "cerca" el uno del otro,
     # cosa que un entero de día-del-año 1-365 no representa bien). Es la variable
     # que más explica el % de generación solar: en España hay mucha más luz e
@@ -363,12 +479,21 @@ def build_dataset(start: date, end: date, forecast_days: int = None) -> pd.DataF
     print("Descargando viento en las 3 regiones eólicas (Aragón, Castilla y León, Galicia)...")
     wind_regions = fetch_wind_regions(start, end, forecast_days)
 
-    df = weather.merge(marine, on="datetime", how="left").merge(wind_regions, on="datetime", how="left")
+    print("Descargando clima ponderado por población en 5 áreas metropolitanas...")
+    demand_climate = fetch_demand_climate(start, end, forecast_days)
+
+    df = (weather.merge(marine, on="datetime", how="left")
+          .merge(wind_regions, on="datetime", how="left")
+          .merge(demand_climate, on="datetime", how="left"))
     if not demanda.empty:
         df = df.merge(demanda, on="datetime", how="left")
     if not generacion.empty:
         df["date_str"] = df["datetime"].dt.strftime("%Y-%m-%d")
         df = df.merge(generacion, left_on="date_str", right_on="date", how="left").drop(columns=["date_str", "date"])
+    if forecast_days is None:
+        print("Descargando precio spot horario (REE)...")
+        precio = fetch_ree_price(start, end)
+        df = df.merge(precio, on="datetime", how="left")
 
     df = add_calendar_features(df)
     if forecast_days is None:
@@ -381,8 +506,14 @@ def build_dataset(start: date, end: date, forecast_days: int = None) -> pd.DataF
 
 
 if __name__ == "__main__":
+    # 10 años en vez de 5 -- el GRU entrenado desde cero necesita más ejemplos
+    # que los modelos anteriores para no sobreajustar. Aviso honesto: para %
+    # renovable esto mete años en los que apenas había solar/eólica instalada
+    # en España (el mix ha cambiado mucho desde 2016), así que esa parte del
+    # histórico antiguo es menos representativa del sistema actual -- se
+    # documenta en el README, no se esconde.
     end = date.today() - timedelta(days=1)
-    start = end - timedelta(days=365 * 5)
+    start = end - timedelta(days=365 * 10)
     df = build_dataset(start, end)
     df.to_csv(CACHE_PATH, index=False)
     print(f"\nGuardado {CACHE_PATH} con {len(df)} filas.")

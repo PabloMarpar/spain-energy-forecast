@@ -24,6 +24,8 @@ import optuna
 import pandas as pd
 import matplotlib.pyplot as plt
 import pmdarima as pm
+import torch
+import torch.nn as nn
 import xgboost as xgb
 from chronos import Chronos2Pipeline
 
@@ -34,7 +36,7 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 COLORS = {"Real": "#0b0b0b", "Baseline": "#898781", "SARIMAX": "#eb6834",
-          "XGBoost": "#2a78d6", "Chronos-2": "#1baf7a", "Ensemble": "#8e44ad"}
+          "XGBoost": "#2a78d6", "GRU": "#d62839", "Chronos-2": "#1baf7a", "Ensemble": "#8e44ad"}
 
 
 # ---------------------------------------------------------------------------
@@ -259,6 +261,146 @@ def xgb_direct_forecast(df: pd.DataFrame, target_col: str, horizon: int, lag_ste
 
 
 # ---------------------------------------------------------------------------
+# GRU directo multi-horizonte (PyTorch) -- el "clásico" de deep learning que
+# faltaba en la comparativa (estadístico, árboles, foundation model, y ahora
+# una red neuronal recurrente entrenada desde cero).
+# ---------------------------------------------------------------------------
+#
+# Igual que con XGBoost, directo y no recursivo: un encoder GRU procesa la
+# ventana de histórico reciente (target + clima pasado), su último estado
+# oculto se combina con un resumen de las variables futuras conocidas (clima
+# previsto para todo el horizonte), y una capa densa produce las `horizon`
+# predicciones de una sola vez -- nada se realimenta paso a paso, así que no
+# hereda el aplanamiento que ya se vio con el forecasting recursivo.
+#
+# Con ~1.800 puntos (renovables) es dudoso que una red entrenada desde cero
+# tenga suficientes ejemplos para no sobreajustar frente a SARIMAX o a un
+# foundation model zero-shot -- se entrena, se mide, y se reporta lo que
+# salga, ganar o no ganar no es el objetivo aquí.
+
+class DirectGRU(nn.Module):
+    def __init__(self, n_past_features: int, n_future_features: int, horizon: int, hidden_size: int = 64):
+        super().__init__()
+        self.encoder = nn.GRU(input_size=n_past_features, hidden_size=hidden_size, batch_first=True)
+        self.future_proj = nn.Linear(n_future_features, hidden_size)
+        self.head = nn.Sequential(
+            nn.Linear(hidden_size * 2, hidden_size), nn.ReLU(), nn.Linear(hidden_size, horizon)
+        )
+
+    def forward(self, past_seq: torch.Tensor, future_feats: torch.Tensor) -> torch.Tensor:
+        _, h_n = self.encoder(past_seq)
+        h = h_n.squeeze(0)
+        f = torch.relu(self.future_proj(future_feats))
+        return self.head(torch.cat([h, f], dim=1))
+
+
+def _standardize(values: np.ndarray, mean: np.ndarray = None, std: np.ndarray = None):
+    if mean is None:
+        mean, std = values.mean(axis=0), values.std(axis=0)
+        std = np.where(std < 1e-8, 1.0, std)
+    return (values - mean) / std, mean, std
+
+
+def build_sequence_dataset(df: pd.DataFrame, target_col: str, past_feature_cols: list,
+                            future_feature_cols: list, window: int, horizon: int, origin_stride: int):
+    """Descarta orígenes cuya ventana pasada o futura contenga algún NaN --
+    imprescindible aquí (a diferencia de XGBoost, que tolera NaN en los splits):
+    un solo NaN en un tensor de PyTorch contamina todo el forward/backward y dos
+    o tres orígenes contaminados bastan para dejar TODOS los pesos del modelo en
+    NaN para siempre. En train.py esto nunca se nota porque `run_comparison` ya
+    limpia el NaN antes de llamar aquí, pero en la predicción en vivo el precio
+    tiene NaN de arranque (`precio_lag_168` no existe hasta la hora 168 del
+    histórico) que sí llegan sin filtrar -- de ahí que haga falta este filtro
+    aquí dentro, no solo confiar en que quien llame ya lo haya limpiado."""
+    values = df[target_col].values.astype(float)
+    past_mat = df[past_feature_cols].values.astype(float)
+    future_mat = df[future_feature_cols].values.astype(float)
+    n = len(df)
+    origins = [
+        o for o in range(window, n - horizon, origin_stride)
+        if not (np.isnan(past_mat[o - window:o]).any()
+                or np.isnan(future_mat[o:o + horizon]).any()
+                or np.isnan(values[o:o + horizon]).any())
+    ]
+    X_past = np.stack([past_mat[o - window:o] for o in origins])
+    X_future = np.stack([future_mat[o:o + horizon].reshape(-1) for o in origins])
+    Y = np.stack([values[o:o + horizon] for o in origins])
+    return X_past, X_future, Y
+
+
+def gru_direct_forecast(df: pd.DataFrame, target_col: str, horizon: int, feature_cols: list,
+                         window: int, origin_stride: int, hidden_size: int = 64,
+                         epochs: int = 30, lr: float = 1e-3, fixed_stats: dict = None):
+    """Si se pasa `fixed_stats` (medias/desviaciones ya calculadas por un
+    entrenamiento previo) se usan directamente para normalizar en vez de
+    recalcularlas -- mismo patrón que `fixed_params` en XGBoost: predict.py
+    reentrena un GRU fresco cada vez (es rápido, unos segundos en CPU), pero
+    con la normalización ya validada, no una nueva de cada tirada."""
+    torch.manual_seed(42)
+    past_feature_cols = [target_col] + feature_cols
+    train_df = df.iloc[:-horizon].reset_index(drop=True)
+    X_past, X_future, Y = build_sequence_dataset(train_df, target_col, past_feature_cols,
+                                                  feature_cols, window, horizon, origin_stride)
+
+    if fixed_stats:
+        past_mean, past_std = np.array(fixed_stats["past_mean"]), np.array(fixed_stats["past_std"])
+        future_mean, future_std = np.array(fixed_stats["future_mean"]), np.array(fixed_stats["future_std"])
+        y_mean, y_std = fixed_stats["y_mean"], fixed_stats["y_std"]
+        X_past_n = (X_past - past_mean) / past_std
+        X_future_n = (X_future - future_mean) / future_std
+        Y_n = (Y - y_mean) / y_std
+    else:
+        X_past_n, past_mean, past_std = _standardize(X_past.reshape(-1, X_past.shape[-1]))
+        X_past_n = X_past_n.reshape(X_past.shape)
+        X_future_n, future_mean, future_std = _standardize(X_future)
+        y_mean, y_std = Y.mean(), Y.std() or 1.0
+        Y_n = (Y - y_mean) / y_std
+
+    model = DirectGRU(len(past_feature_cols), X_future.shape[1], horizon, hidden_size)
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    loss_fn = nn.MSELoss()
+    past_t = torch.tensor(X_past_n, dtype=torch.float32)
+    future_t = torch.tensor(X_future_n, dtype=torch.float32)
+    y_t = torch.tensor(Y_n, dtype=torch.float32)
+
+    model.train()
+    batch_size = min(64, len(past_t))
+    n_batches = max(1, len(past_t) // batch_size)
+    for _epoch in range(epochs):
+        perm = torch.randperm(len(past_t))
+        for b in range(n_batches):
+            idx = perm[b * batch_size:(b + 1) * batch_size]
+            if len(idx) == 0:
+                continue
+            opt.zero_grad()
+            pred = model(past_t[idx], future_t[idx])
+            loss = loss_fn(pred, y_t[idx])
+            loss.backward()
+            opt.step()
+
+    # Predicción real: un único origen (el final de train_df, con datos 100%
+    # reales) -- igual que en el resto de modelos directos.
+    last_past = df[past_feature_cols].iloc[-horizon - window:-horizon].values.astype(float)
+    last_future = df[feature_cols].iloc[-horizon:].values.astype(float).reshape(1, -1)
+    if np.isnan(last_past).any() or np.isnan(last_future).any():
+        raise ValueError("NaN en la ventana de predicción del GRU (revisa las columnas de feature_cols)")
+    last_past_n = ((last_past - past_mean) / past_std)[None, ...]
+    last_future_n = (last_future - future_mean) / future_std
+
+    model.eval()
+    with torch.no_grad():
+        pred_n = model(torch.tensor(last_past_n, dtype=torch.float32),
+                        torch.tensor(last_future_n, dtype=torch.float32))
+    preds = pred_n.numpy().reshape(-1) * y_std + y_mean
+    index = df.iloc[-horizon:].set_index("datetime").index
+    stats = {"past_mean": past_mean.tolist(), "past_std": past_std.tolist(),
+             "future_mean": future_mean.tolist(), "future_std": future_std.tolist(),
+             "y_mean": float(y_mean), "y_std": float(y_std),
+             "window": window, "hidden_size": hidden_size, "epochs": epochs}
+    return pd.Series(preds, index=index), model, past_feature_cols, stats
+
+
+# ---------------------------------------------------------------------------
 # Chronos-2 con covariables (clima + calendario)
 # ---------------------------------------------------------------------------
 
@@ -414,7 +556,7 @@ def run_decomposed_renewable(daily: pd.DataFrame, feature_cols: list, lag_steps:
 def run_comparison(df: pd.DataFrame, target_col: str, horizon: int, baseline_season_len: int,
                     lag_steps: list, roll_windows: list, feature_cols: list,
                     chronos_pipeline, label: str, ylabel: str, near_far_split: int,
-                    origin_stride: int, sarimax_max_train: int = None, sarimax_period: int = 7,
+                    origin_stride: int, gru_window: int, sarimax_max_train: int = None, sarimax_period: int = 7,
                     sarimax_auto_search: bool = True, sarimax_fixed_order=None,
                     sarimax_fixed_seasonal_order=None, xgb_trials: int = 40) -> dict:
     data_ = df.dropna(subset=[target_col] + feature_cols).reset_index(drop=True)
@@ -460,6 +602,20 @@ def run_comparison(df: pd.DataFrame, target_col: str, horizon: int, baseline_sea
     results["XGBoost"]["mejora_vs_baseline_%"] = round(
         (baseline_mape - results["XGBoost"]["MAPE_%"]) / baseline_mape * 100, 1)
     print("XGBoost (Optuna):", results["XGBoost"])
+
+    try:
+        gru_pred, gru_model, gru_features, gru_stats = gru_direct_forecast(
+            data_, target_col, horizon, feature_cols, gru_window, origin_stride
+        )
+        forecasts["GRU"] = gru_pred.values
+        results["GRU"] = metrics(actual_holdout, gru_pred)
+        results["GRU"].update(horizon_breakdown(actual_holdout.values, gru_pred.values, near_far_split))
+        results["GRU"]["stats_normalizacion"] = gru_stats
+        results["GRU"]["mejora_vs_baseline_%"] = round(
+            (baseline_mape - results["GRU"]["MAPE_%"]) / baseline_mape * 100, 1)
+        print("GRU (PyTorch, directo):", {k: v for k, v in results["GRU"].items() if k != "stats_normalizacion"})
+    except Exception as exc:
+        print(f"GRU falló ({exc}), se omite de la comparativa.")
 
     try:
         train_features = data_.iloc[:-horizon][["datetime"] + feature_cols]
@@ -537,14 +693,24 @@ def main():
 
     all_results = {}
 
+    # Precio solo como *lag* (nunca como "futuro conocido"): en producción el
+    # precio de mañana en adelante no se conoce con certeza más allá de un día
+    # (mercado diario), así que usarlo como covariable futura en la evaluación
+    # sería una fuga de información sutil. Como lag sí es 100% legítimo.
+    df["precio_lag_24"] = df["precio_eur_mwh"].shift(24)
+    df["precio_lag_168"] = df["precio_eur_mwh"].shift(168)
+
     demand_features = ["temperature_2m", "relative_humidity_2m", "shortwave_radiation",
-                        "wind_speed_10m", "wind_speed_100m", "is_weekend", "is_holiday"]
+                        "wind_speed_10m", "wind_speed_100m", "is_weekend", "is_holiday",
+                        "temperature_national", "humidity_national", "hdd", "cdd",
+                        "regional_holiday_pct", "precio_lag_24", "precio_lag_168"]
     all_results["demanda_mwh"] = run_comparison(
         df, "demanda_mwh", horizon=24 * 7, baseline_season_len=24 * 7,
         lag_steps=[24, 48, 168, 336], roll_windows=[24, 168],
         feature_cols=demand_features,
         chronos_pipeline=chronos_pipeline, label="Demanda eléctrica (MWh/h)", ylabel="MWh",
-        near_far_split=24, origin_stride=24, sarimax_max_train=24 * 120, sarimax_auto_search=False,
+        near_far_split=24, origin_stride=24, gru_window=24 * 14,
+        sarimax_max_train=24 * 120, sarimax_auto_search=False,
         sarimax_fixed_order=(2, 0, 2), sarimax_fixed_seasonal_order=(1, 0, 1, 24),
     )
 
@@ -589,12 +755,19 @@ def main():
     # estamos, mucho más estable año a año que la meteorología día a día -- con
     # 5 años de histórico ya hay suficientes ciclos anuales completos para que el
     # modelo pueda aprovecharlas.
+    # wave_height ya no está en la lista: además de confirmarse repetidamente
+    # como poco relevante (importancia de variable siempre baja), al extender
+    # el histórico a 10 años apareció un hueco real de ~77 días en el archivo
+    # de Open-Meteo Marine de hace varios años -- con SARIMAX usando todo el
+    # histórico sin ventana en renovables, ese hueco rompía el ajuste
+    # (`exog contains inf or nans`). Parchear el hueco de una variable que ya
+    # sabíamos que aportaba poco no compensaba frente a simplemente retirarla.
     renewable_features = ["shortwave_radiation", "shortwave_radiation_max", "direct_radiation",
                            "cloud_cover", "wind_speed_10m", "wind_speed_10m_max",
                            "wind_speed_100m", "wind_speed_100m_max",
                            "wind_national_mean_100m", "wind_national_max_100m", "wind_national_std_100m",
                            "wind_power_proxy", "wind_power_proxy_max", "precipitation",
-                           "surface_pressure", "wave_height", "doy_sin", "doy_cos",
+                           "surface_pressure", "doy_sin", "doy_cos",
                            "is_weekend", "is_holiday"]
     roll_windows_renewable = [7, 30] if len(daily) > 400 else [7]
     lag_steps_renewable = [1, 7, 14, 30, 365] if len(daily) > 400 else [1, 7, 14]
@@ -603,7 +776,7 @@ def main():
         lag_steps=lag_steps_renewable, roll_windows=roll_windows_renewable,
         feature_cols=renewable_features,
         chronos_pipeline=chronos_pipeline, label="% Generación renovable", ylabel="%",
-        near_far_split=1, origin_stride=1, sarimax_period=7,
+        near_far_split=1, origin_stride=1, gru_window=60, sarimax_period=7,
     )
 
     print("\n-- Experimento: % renovable descompuesto por tecnología (solar+eólica+hidráulica+otras) --")

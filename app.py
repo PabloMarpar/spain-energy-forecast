@@ -25,9 +25,9 @@ st.set_page_config(page_title="Demanda eléctrica y renovables en España", page
 # "real" en blanco roto para que destaque siempre sobre el fondo oscuro, algo que
 # el negro casi puro que se usa en las gráficas estáticas (fondo blanco) no hacía.
 COLORS = {"real": "#f2f2f2", "Baseline": "#9aa0a6", "SARIMAX": "#ff8a3d",
-          "XGBoost": "#4da3ff", "Chronos-2": "#2dd4a7", "Ensemble": "#c874e0",
+          "XGBoost": "#4da3ff", "GRU": "#ff5c7a", "Chronos-2": "#2dd4a7", "Ensemble": "#c874e0",
           "XGBoost (descompuesto)": "#ffc857"}
-DASH = {"Baseline": "dot", "SARIMAX": "dash", "XGBoost": "dashdot", "Chronos-2": "dash",
+DASH = {"Baseline": "dot", "SARIMAX": "dash", "XGBoost": "dashdot", "GRU": "longdashdot", "Chronos-2": "dash",
         "Ensemble": "longdash", "XGBoost (descompuesto)": "dot"}
 
 TECH_BUCKETS = {
