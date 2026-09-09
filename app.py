@@ -15,7 +15,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from data import CACHE_PATH, add_calendar_features
+from data import CACHE_PATH, add_calendar_features, fetch_ree_demanda, fetch_ree_generacion
 
 OUTPUT_DIR = Path("outputs")
 
@@ -24,7 +24,7 @@ st.set_page_config(page_title="Demanda eléctrica y renovables en España", page
 # Paleta pensada para el tema oscuro de Streamlit (ver .streamlit/config.toml) --
 # "real" en blanco roto para que destaque siempre sobre el fondo oscuro, algo que
 # el negro casi puro que se usa en las gráficas estáticas (fondo blanco) no hacía.
-COLORS = {"real": "#f2f2f2", "Baseline": "#9aa0a6", "SARIMAX": "#ff8a3d",
+COLORS = {"real": "#f2f2f2", "real (ya ocurrido)": "#f2f2f2", "Baseline": "#9aa0a6", "SARIMAX": "#ff8a3d",
           "XGBoost": "#4da3ff", "GRU": "#ff5c7a", "Chronos-2": "#2dd4a7", "Ensemble": "#c874e0",
           "XGBoost (descompuesto)": "#ffc857"}
 DASH = {"Baseline": "dot", "SARIMAX": "dash", "XGBoost": "dashdot", "GRU": "longdashdot", "Chronos-2": "dash",
@@ -73,6 +73,41 @@ def load_cached_forecast() -> dict | None:
         return None
     with open(path, encoding="utf-8") as fh:
         return json.load(fh)
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def load_recent_actuals(start_iso: str, end_iso: str) -> tuple[pd.Series, pd.Series]:
+    """Demanda horaria y % renovable diario YA PUBLICADOS por REE entre `start_iso`
+    y `end_iso` (fechas ISO, `end_iso` exclusivo) -- se usa para comparar, en la
+    predicción "en tiempo real", lo que de verdad pasó en los días del horizonte
+    que ya han quedado atrás contra lo que se había predicho para ellos. REE tarda
+    unas horas en publicar los datos más recientes, así que la cola más reciente
+    puede faltar todavía -- eso se traduce en huecos (NaN), no en un error."""
+    from datetime import date as _date
+    start_d, end_d = _date.fromisoformat(start_iso), _date.fromisoformat(end_iso)
+    if start_d >= end_d:
+        return pd.Series(dtype=float), pd.Series(dtype=float)
+    demanda = fetch_ree_demanda(start_d, end_d)
+    generacion = fetch_ree_generacion(start_d, end_d)
+    demanda_s = demanda.set_index("datetime")["demanda_mwh"] if not demanda.empty else pd.Series(dtype=float)
+    renovable_s = pd.Series(dtype=float)
+    if not generacion.empty:
+        renovable_s = generacion.assign(date=pd.to_datetime(generacion["date"])).set_index("date")["renewable_pct"]
+    return demanda_s, renovable_s
+
+
+def _elapsed_mape(pred: pd.Series, real: pd.Series) -> float | None:
+    """MAPE de la predicción sobre la parte del horizonte que ya se puede
+    contrastar con datos reales -- solo sobre los puntos donde ambas series
+    tienen valor (real ya publicado por REE), nunca sobre huecos."""
+    common = pred.index.intersection(real.dropna().index)
+    if len(common) == 0:
+        return None
+    actual, predicted = real.loc[common], pred.loc[common]
+    nonzero = actual != 0
+    if nonzero.sum() == 0:
+        return None
+    return float((abs(actual[nonzero] - predicted[nonzero]) / abs(actual[nonzero])).mean() * 100)
 
 
 def metrics_table(target_results: dict) -> pd.DataFrame:
@@ -245,7 +280,10 @@ Esta sección **recalcula la predicción bajo demanda**, combinando el históric
 reciente con la previsión meteorológica real de Open-Meteo para los próximos 7 días
 (no es un stream continuo -- de ahí las comillas en "tiempo real": se genera cuando se
 pulsa el botón, tarda entre 30 segundos y 2 minutos según qué modelo toque cargar, y se
-cachea unas horas para no repetir el cálculo en cada visita).
+cachea unas horas para no repetir el cálculo en cada visita). Si desde que se generó ya
+ha pasado algún día del horizonte, se compara automáticamente contra lo que REE ya ha
+publicado de verdad para esos días (serie **real (ya ocurrido)**) -- así la predicción
+se puede seguir contrastando con la realidad después de generada, no solo en el momento.
 """
     )
     cached = load_cached_forecast()
@@ -284,21 +322,54 @@ cachea unas horas para no repetir el cálculo en cada visita).
         st.dataframe(resumen, use_container_width=True, hide_index=True)
 
         demanda_fut = pd.DataFrame(forecast["demanda_mwh"])
-        demanda_fut["datetime"] = pd.to_datetime(demanda_fut["datetime"])
+        demanda_fut["datetime"] = pd.to_datetime(demanda_fut["datetime"], utc=True).dt.tz_convert("Europe/Madrid")
+        renovable_fut = pd.DataFrame(forecast["renovable_pct"])
+        renovable_fut["date_dt"] = pd.to_datetime(renovable_fut["date"])
+
+        # Si parte del horizonte de esta predicción ya ha pasado (p.ej. se generó
+        # el lunes y hoy es miércoles), se compara contra lo que REE ya ha
+        # publicado de verdad para esos días -- no solo se enseña la predicción,
+        # se contrasta con la realidad en cuanto hay datos para hacerlo.
+        today = pd.Timestamp.now(tz="Europe/Madrid").normalize()
+        forecast_start = demanda_fut["datetime"].min().normalize()
+        demanda_real_elapsed = pd.Series(dtype=float)
+        renovable_real_elapsed = pd.Series(dtype=float)
+        if pd.notna(forecast_start) and forecast_start < today:
+            demanda_real_elapsed, renovable_real_elapsed = load_recent_actuals(
+                str(forecast_start.date()), str(today.date()))
+
+        demanda_fut["real"] = demanda_fut["datetime"].map(demanda_real_elapsed)
+        renovable_fut["real"] = renovable_fut["date_dt"].map(renovable_real_elapsed)
+
         recent_history = history[history["datetime"] >= history["datetime"].max() - pd.Timedelta(days=7)]
         fig_d = line_chart(
             pd.concat([recent_history["datetime"], demanda_fut["datetime"]]),
             {"real (últimos 7 días)": pd.concat(
                 [recent_history["demanda_mwh"], pd.Series([None] * len(demanda_fut))]),
              "predicción próximos 7 días": pd.concat(
-                [pd.Series([None] * len(recent_history)), demanda_fut["mwh"]])},
+                [pd.Series([None] * len(recent_history)), demanda_fut["mwh"]]),
+             "real (ya ocurrido)": pd.concat(
+                [pd.Series([None] * len(recent_history)), demanda_fut["real"]])},
             "Demanda eléctrica: contexto reciente + predicción a 7 días", "MWh")
         st.plotly_chart(fig_d, use_container_width=True)
 
-        renovable_fut = pd.DataFrame(forecast["renovable_pct"])
-        fig_r = line_chart(renovable_fut["date"], {"predicción % renovable": renovable_fut["pct"]},
+        fig_r = line_chart(renovable_fut["date"],
+                            {"predicción % renovable": renovable_fut["pct"],
+                             "real (ya ocurrido)": renovable_fut["real"]},
                             "% de generación renovable prevista", "%")
         st.plotly_chart(fig_r, use_container_width=True)
+
+        mape_demanda = _elapsed_mape(demanda_fut.set_index("datetime")["mwh"], demanda_real_elapsed)
+        mape_renovable = _elapsed_mape(renovable_fut.set_index("date_dt")["pct"], renovable_real_elapsed)
+        if mape_demanda is not None or mape_renovable is not None:
+            st.caption("**Error real de esta predicción, medido sobre los días del horizonte que ya han "
+                       "pasado** (comparado contra lo publicado por REE, no contra el holdout de "
+                       "entrenamiento):")
+            col_m1, col_m2 = st.columns(2)
+            if mape_demanda is not None:
+                col_m1.metric("MAPE demanda (transcurrido)", f"{mape_demanda:.1f}%")
+            if mape_renovable is not None:
+                col_m2.metric("MAPE % renovable (transcurrido)", f"{mape_renovable:.1f}%")
 
         if forecast.get("desglose_tecnologia"):
             st.markdown("#### Desglose por tecnología (solar, eólica, hidráulica, otras)")
