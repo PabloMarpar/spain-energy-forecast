@@ -185,8 +185,8 @@ la red manejan mucho mejor gracias a la regularización.
 | Modelo | MAE | RMSE | MAPE % | sMAPE % | R² | Mejora vs. baseline |
 |---|---|---|---|---|---|---|
 | Baseline | 5.29 | 6.48 | 10.54 | 9.74 | -2.65 | -- |
-| **XGBoost (descompuesto por tecnología) 🏆** | 1.67 | 2.05 | **3.27** | 3.21 | 0.63 | **+69.0%** |
-| Ensemble (SARIMAX+XGBoost+GRU+Chronos-2) | 1.47 | 2.08 | 2.93 | 2.86 | 0.62 | +72.2% |
+| **Ensemble (SARIMAX+XGBoost+GRU+Chronos-2) 🏆** | 1.47 | 2.08 | **2.93** | 2.86 | 0.62 | **+72.2%** |
+| XGBoost (descompuesto por tecnología) | 1.67 | 2.05 | 3.27 | 3.21 | 0.63 | +69.0% |
 | XGBoost (directo, Optuna) | 1.67 | 2.48 | 3.35 | 3.23 | 0.47 | +68.2% |
 | Chronos-2 (zero-shot + covariables) | 1.74 | 2.58 | 3.52 | 3.39 | 0.42 | +66.6% |
 | GRU (PyTorch, directo) | 1.86 | 2.41 | 3.69 | 3.67 | 0.50 | +65.0% |
@@ -194,12 +194,11 @@ la red manejan mucho mejor gracias a la regularización.
 
 Todos los modelos "de verdad" quedan en un rango muy apretado (2.9%-3.8% MAPE, 63-72% de
 mejora sobre el baseline) -- la señal de renovables mejoró tanto al arreglar el viento y
-limpiar los bugs que la diferencia entre "el mejor" y "el peor" real ya es pequeña. El
-Ensemble (2.93%) y la descomposición por tecnología (3.27%) quedan a 0.34 puntos, dentro de
-la tolerancia de empate ya documentada (0.5 puntos) -- se prefiere la descomposición porque,
-a igualdad (casi) de precisión, da el desglose por tecnología que el resto no ofrece.
+limpiar los bugs que la diferencia entre "el mejor" y "el peor" real ya es pequeña. Gana el
+Ensemble, sin excepciones ni tolerancias de empate: es sencillamente el que menos error
+tiene.
 
-### Un experimento con final honesto: descomponer por tecnología
+### Un experimento honesto que no gana: descomponer por tecnología
 
 Hipótesis: solar, eólica e hidráulica tienen dinámicas muy distintas (solar casi
 determinista por el ciclo anual, eólica errática, hidráulica lenta), así que predecir cada
@@ -207,11 +206,11 @@ una por separado y sumarlas debería ganarle al modelo sobre el agregado. La pri
 se probó (antes de arreglar el viento) perdía por goleada -- el error de la pieza más
 ruidosa (eólica) se acumulaba en la suma en vez de cancelarse. Arreglado el viento (regiones
 eólicas reales + unidades correctas + los 10 años completos), la eólica mejoró mucho (MAE de
-3.87 a ~1.7-2.2) y la brecha se cerró del todo: en la comparativa final, la descomposición
-(3.27% MAPE) queda dentro del margen de empate del mejor modelo agregado (Ensemble, 2.93%) y
-se adopta como campeón oficial de renovables -- no porque "gane" siempre (en pruebas
-anteriores, con menos datos, perdía claramente), sino porque con datos limpios y suficientes
-la hipótesis de partida se sostiene.
+3.87 a ~1.7-2.2) y la brecha se cerró bastante -- pero sigue sin ganarle al Ensemble (3.27%
+frente a 2.93%). Una versión anterior de este README la daba por campeona "por estar cerca",
+razonando que de paso regalaba el desglose por tecnología -- pero ese desglose se muestra
+siempre en la app, gane quien gane (ver más abajo), así que esa razón no sostenía nada real:
+era preferir un número peor sin ganar nada a cambio. Se corrigió: gana el que de verdad gana.
 
 ![Demanda: real vs. predicción](outputs/demanda_mwh_comparativa.png)
 ![Mix de generación eléctrica por tecnología](outputs/generation_mix.png)

@@ -5257,7 +5257,7 @@
       ],
       "mejora_vs_baseline_%": 72.2
     },
-    "_campeon": "XGBoost (descompuesto)",
+    "_campeon": "Ensemble",
     "XGBoost (descompuesto)": {
       "MAE": 1.672,
       "RMSE": 2.051,

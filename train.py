@@ -789,30 +789,20 @@ def main():
         (baseline_mape - decomposed_result["MAPE_%"]) / baseline_mape * 100, 1)
     print("XGBoost (descompuesto):", {k: v for k, v in decomposed_result.items() if k != "sub_modelos"})
     all_results["renewable_pct"]["XGBoost (descompuesto)"] = decomposed_result
-    best_pure = min(
+    # Sin tolerancia de empate: gana el que menos MAPE tenga, punto. Se probó
+    # una regla que prefería la descomposición "a igualdad (casi) de precisión
+    # porque da el desglose por tecnología de propina" -- pero el desglose ya
+    # se muestra siempre en la app (ver forecast_technology_breakdown en
+    # predict.py), gane quien gane, así que esa razón no sostenía nada: era
+    # forzar un número peor sin ganar nada real a cambio. Mismo criterio que
+    # en el resto del proyecto, sin excepciones para este caso.
+    champion = min(
         (k for k in all_results["renewable_pct"] if k != "_campeon"),
         key=lambda name: all_results["renewable_pct"][name]["MAPE_%"],
     )
-    previous_champion = all_results["renewable_pct"]["_campeon"]
-    # Regla de desempate documentada, no un override silencioso: si la
-    # descomposición por tecnología queda dentro de 0.5 puntos de MAPE del mejor
-    # modelo puro, se prefiere -- a igualdad (casi) de precisión, da además el
-    # desglose por tecnología gratis, que el modelo agregado no puede ofrecer.
-    TIE_TOLERANCE = 0.5
-    decomposed_mape = decomposed_result["MAPE_%"]
-    best_pure_mape = all_results["renewable_pct"][best_pure]["MAPE_%"]
-    if decomposed_mape <= best_pure_mape + TIE_TOLERANCE:
-        champion = "XGBoost (descompuesto)"
-    else:
-        champion = best_pure
     all_results["renewable_pct"]["_campeon"] = champion
-    if champion == "XGBoost (descompuesto)":
-        print(f"Campeón: XGBoost (descompuesto) -- MAPE {decomposed_mape}% frente a {best_pure_mape}% "
-              f"del mejor modelo agregado ({best_pure}); dentro de la tolerancia de empate "
-              f"({TIE_TOLERANCE} puntos), y de propina da el desglose por tecnología.")
-    else:
-        print(f"La descomposición no queda lo bastante cerca del campeón ({previous_champion}, "
-              f"MAPE {best_pure_mape}% vs. {decomposed_mape}%) -- se reporta igualmente, no se fuerza.")
+    print(f"Campeón para % Generación renovable: {champion} "
+          f"(MAPE {all_results['renewable_pct'][champion]['MAPE_%']}%)")
 
     holdout_path = OUTPUT_DIR / "renewable_pct_predicciones_holdout.csv"
     holdout_df = pd.read_csv(holdout_path)
