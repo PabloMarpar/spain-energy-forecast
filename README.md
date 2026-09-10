@@ -55,6 +55,14 @@ documentado de forma que pueda defenderlo en una entrevista, no solo enseñarlo.
   mañana en adelante no se conoce con certeza más allá de un día.
 - **Festivos regionales ponderados por población** -- una fiesta en La Rioja (0.6% de la
   población) no pesa igual que una en Andalucía o Cataluña (16-18%).
+- **Lluvia acumulada de 30/90 días** (derivada de la precipitación de Open-Meteo, coste cero)
+  -- para % renovable. La hidráulica no depende de si llovió ayer, sino de cuánta agua se ha
+  ido acumulando en los embalses durante meses; la precipitación de un solo día no captura eso.
+- **Demanda diaria como covariable del % renovable** -- por el orden de mérito del mercado
+  eléctrico: las renovables entran siempre primero (coste marginal ~0), así que un día de
+  mucha demanda no añade más renovable, añade más térmica de respaldo por encima, diluyendo
+  el % aunque la generación renovable en bruto sea la misma. Mismo dataset que ya trae la
+  demanda, coste cero también.
 
 ## Los datos: 10 años, no 5
 
@@ -110,6 +118,34 @@ mantuvo o mejoró.
   pretendidos. Como el oleaje ya se sabía poco relevante (importancia de variable siempre
   baja), se retiró del modelado en vez de parchear el hueco -- y el histórico de renovables
   pasó de golpe de 1.802 a 3.650 puntos reales.
+- **Ajustar el GRU con Optuna lo empeoró, no lo mejoró.** El GRU siempre había usado
+  hidden_size/épocas/learning rate fijos, sin buscar -- se añadió una búsqueda con Optuna
+  (igual que ya tenía XGBoost) esperando mejorarlo. Con el presupuesto de pruebas que el
+  tiempo de cómputo permitía (4 por objetivo, cada una entrena una red desde cero), el
+  resultado fue peor: el MAPE de demanda pasó de 3.27% a **4.79%** -- la búsqueda, a ciegas y
+  con tan pocas pruebas, no daba con nada mejor que los valores manuales que ya funcionaban,
+  y el nuevo dropout probado tampoco ayudaba en una serie con señal fuerte como la demanda.
+  Arreglado añadiendo los valores por defecto de siempre como una prueba más
+  (`study.enqueue_trial(...)`) -- así Optuna nunca puede devolver algo peor que eso, en el
+  peor caso empata. Con el arreglo, demanda quedó en 3.76% (variación normal de semilla
+  aleatoria frente al 3.27% original, no un empeoramiento) y renovable en 6.15% (mejor que el
+  7.39% roto, aunque sin superar el 3.69% original -- ese modelo en concreto no gana de
+  todos modos, ver Resultados).
+
+## Rendimiento: de reentrenar en cada click a servir pesos ya entrenados
+
+"Predicción en tiempo real" reentrenaba XGBoost y el GRU desde cero en cada click -- al
+añadir la reconstrucción retrospectiva de los últimos días y el desglose por tecnología, un
+solo click llegó a reentrenar 3-4 GRU y varios XGBoost seguidos, suficiente para disparar el
+*throttling* de CPU de Streamlit Community Cloud. No hacía falta: los hiperparámetros ya
+estaban validados por `train.py`, solo hacía falta cargar los pesos y hacer un *forward pass*.
+
+`train.py` ahora guarda los modelos entrenados a disco (`outputs/models/`) y `predict.py` los
+carga en vez de reentrenar, con reintento a entrenamiento en vivo si el fichero no existe o
+no coincide con las variables actuales. Medido: la predicción completa (demanda +
+retrospectivo de 7 días + % renovable + desglose por tecnología + intervalos) pasó de 1-3
+minutos a **26 segundos**. De paso, ninguno de los dos campeones actuales usa Chronos-2, así
+que ni siquiera hace falta cargar el *foundation model*.
 
 ## Los modelos
 
@@ -130,7 +166,8 @@ mantuvo o mejoró.
    sola vez -- directo, no recursivo, mismo motivo que XGBoost. Con ~1.800-3.650 puntos en
    renovables era dudoso que una red entrenada desde cero tuviera suficientes ejemplos para
    no sobreajustar frente a SARIMAX o Chronos-2 zero-shot -- en demanda (87K puntos horarios)
-   tenía muchas más opciones.
+   tenía muchas más opciones. Hiperparámetros (tamaño oculto, dropout, learning rate, épocas)
+   ajustados con Optuna, igual que XGBoost.
 5. **Chronos-2** (Amazon) -- *foundation model* de series temporales pre-entrenado.
    Funciona en modo **zero-shot**: no se reentrena con estos datos, solo se le da el
    histórico reciente como contexto y el clima previsto como covariable adicional. Que
@@ -160,57 +197,110 @@ ciclo anual -- justo lo que se quería. El MAPE de % renovable con XGBoost bajó
 ## Resultados
 
 *(10 años de histórico -- ~87.400 puntos horarios de demanda, 3.650 días de % renovable --
-holdout = últimos 7 días, nunca aleatorio; con todos los bugs ya corregidos)*
+holdout = últimos 7 días, nunca aleatorio)*
 
 ### Demanda eléctrica (MWh/h, horizonte 7 días)
 
 | Modelo | MAE | RMSE | MAPE % | sMAPE % | R² | Mejora vs. baseline |
 |---|---|---|---|---|---|---|
 | Baseline | 3211.3 | 3811.4 | 10.37 | 11.14 | 0.15 | -- |
-| **GRU (PyTorch, directo) 🏆** | 1021.5 | 1244.0 | **3.27** | 3.34 | 0.91 | **+68.5%** |
-| Ensemble (SARIMAX+XGBoost+GRU+Chronos-2) | 1879.0 | 2133.9 | 5.97 | 6.19 | 0.74 | +42.4% |
-| XGBoost (directo, Optuna) | 1885.7 | 2199.0 | 6.00 | 6.23 | 0.72 | +42.1% |
+| **GRU (PyTorch, directo) -- campeón** | 1181.3 | 1451.4 | **3.76** | 3.85 | 0.88 | **+63.7%** |
+| XGBoost (directo, Optuna) | 1852.6 | 2225.8 | 5.85 | 6.07 | 0.71 | +43.6% |
+| Ensemble (SARIMAX+XGBoost+GRU+Chronos-2) | 1917.4 | 2202.9 | 6.08 | 6.30 | 0.72 | +41.4% |
 | SARIMAX | 2480.9 | 2836.9 | 8.10 | 8.43 | 0.53 | +21.9% |
 | Chronos-2 (zero-shot + covariables) | 2527.5 | 2851.6 | 8.05 | 8.46 | 0.53 | +22.4% |
 
-Con 10 años de histórico y clima multi-ciudad/HDD-CDD/precio/festivos regionales, el GRU
-entrenado desde cero destroza al resto -- pasa de no existir en la comparativa a ganar con
-mucho margen (68.5% de mejora, R²=0.91). SARIMAX, en cambio, **empeoró** al doblar el número
-de variables exógenas (de 7 a 14) sin ampliar su ventana fija de entrenamiento (120 días) --
-un caso real de sobreajuste/multicolinealidad en los coeficientes exógenos que los árboles y
-la red manejan mucho mejor gracias a la regularización.
+El GRU entrenado desde cero gana con margen claro sobre el resto (R²=0.88). SARIMAX, en
+cambio, empeoró al doblar el número de variables exógenas (de 7 a 14) sin ampliar su ventana
+fija de entrenamiento (120 días) -- sobreajuste/multicolinealidad en los coeficientes
+exógenos que los árboles y la red manejan mejor gracias a la regularización.
 
 ### % Generación renovable (horizonte 7 días)
 
 | Modelo | MAE | RMSE | MAPE % | sMAPE % | R² | Mejora vs. baseline |
 |---|---|---|---|---|---|---|
 | Baseline | 5.29 | 6.48 | 10.54 | 9.74 | -2.65 | -- |
-| **Ensemble (SARIMAX+XGBoost+GRU+Chronos-2) 🏆** | 1.47 | 2.08 | **2.93** | 2.86 | 0.62 | **+72.2%** |
-| XGBoost (descompuesto por tecnología) | 1.67 | 2.05 | 3.27 | 3.21 | 0.63 | +69.0% |
-| XGBoost (directo, Optuna) | 1.67 | 2.48 | 3.35 | 3.23 | 0.47 | +68.2% |
-| Chronos-2 (zero-shot + covariables) | 1.74 | 2.58 | 3.52 | 3.39 | 0.42 | +66.6% |
-| GRU (PyTorch, directo) | 1.86 | 2.41 | 3.69 | 3.67 | 0.50 | +65.0% |
-| SARIMAX | 1.98 | 2.07 | 3.82 | 3.82 | 0.63 | +63.8% |
+| **XGBoost (directo, Optuna) -- campeón** | 1.37 | 1.73 | **2.69** | 2.66 | 0.74 | **+74.5%** |
+| Chronos-2 (zero-shot + covariables) | 1.38 | 2.10 | 2.81 | 2.72 | 0.62 | +73.3% |
+| XGBoost (descompuesto por tecnología) | 1.58 | 2.01 | 3.08 | 3.13 | 0.65 | +70.8% |
+| Ensemble (SARIMAX+XGBoost+GRU+Chronos-2) | 1.98 | 2.03 | 3.81 | 3.83 | 0.64 | +63.9% |
+| SARIMAX | 2.26 | 2.54 | 4.28 | 4.39 | 0.44 | +59.4% |
+| GRU (PyTorch, directo) | 3.25 | 3.66 | 6.15 | 6.37 | -0.17 | +41.7% |
 
-Todos los modelos "de verdad" quedan en un rango muy apretado (2.9%-3.8% MAPE, 63-72% de
-mejora sobre el baseline) -- la señal de renovables mejoró tanto al arreglar el viento y
-limpiar los bugs que la diferencia entre "el mejor" y "el peor" real ya es pequeña. Gana el
-Ensemble, sin excepciones ni tolerancias de empate: es sencillamente el que menos error
-tiene.
+XGBoost pasa a campeón tras añadir lluvia acumulada (30/90 días) y demanda diaria como
+covariable -- Chronos-2, que recibe las mismas variables nuevas, también mejora (era 3.52%
+antes); SARIMAX en cambio empeora (3.82% antes → 4.28%), probablemente por colinealidad entre
+las dos variables de lluvia acumulada en su ajuste lineal. El backtest de abajo matiza este
+campeonato: sobre varias ventanas, Chronos-2 es más consistente que XGBoost.
 
 ### Un experimento honesto que no gana: descomponer por tecnología
 
 Hipótesis: solar, eólica e hidráulica tienen dinámicas muy distintas (solar casi
 determinista por el ciclo anual, eólica errática, hidráulica lenta), así que predecir cada
-una por separado y sumarlas debería ganarle al modelo sobre el agregado. La primera vez que
-se probó (antes de arreglar el viento) perdía por goleada -- el error de la pieza más
-ruidosa (eólica) se acumulaba en la suma en vez de cancelarse. Arreglado el viento (regiones
-eólicas reales + unidades correctas + los 10 años completos), la eólica mejoró mucho (MAE de
-3.87 a ~1.7-2.2) y la brecha se cerró bastante -- pero sigue sin ganarle al Ensemble (3.27%
-frente a 2.93%). Una versión anterior de este README la daba por campeona "por estar cerca",
-razonando que de paso regalaba el desglose por tecnología -- pero ese desglose se muestra
-siempre en la app, gane quien gane (ver más abajo), así que esa razón no sostenía nada real:
-era preferir un número peor sin ganar nada a cambio. Se corrigió: gana el que de verdad gana.
+una por separado y sumarlas debería ganarle al modelo sobre el agregado. Sigue sin ganar
+(3.08% frente al 2.69% de XGBoost agregado) -- se documenta igual, gane o no.
+
+## Backtesting: por qué un solo holdout no basta
+
+Un único holdout de 7 días es una sola muestra: si esa semana en concreto fue rara, el MAPE
+que sale puede ser optimista o pesimista solo por suerte. El backtest evalúa varias ventanas
+de 7 días consecutivas al final de la serie, cada una con su propio entrenamiento expansivo
+(todo lo anterior a esa ventana) -- 3 ventanas en demanda, 5 en renovable (menos que lo ideal
+por coste de cómputo, ver limitaciones). SARIMAX y XGBoost reutilizan en cada ventana el
+orden/hiperparámetros ya validados en el holdout único; el GRU sí reentrena y recalcula su
+normalización por ventana, porque esas estadísticas dependen de los datos de esa ventana en
+concreto.
+
+### Demanda (3 ventanas)
+
+| Modelo | MAPE % (media) | MAPE % (desv.) |
+|---|---|---|
+| **GRU** | **3.55** | 0.79 |
+| Ensemble | 3.96 | 2.03 |
+| Chronos-2 | 4.20 | 3.34 |
+| XGBoost | 4.69 | 1.03 |
+| SARIMAX | 6.98 | 1.28 |
+| Baseline | 6.97 | 2.99 |
+
+El GRU gana también aquí, y de forma consistente en las tres ventanas -- coincide con el
+campeón del holdout único.
+
+### % Renovable (5 ventanas)
+
+| Modelo | MAPE % (media) | MAPE % (desv.) |
+|---|---|---|
+| **Chronos-2** | **2.22** | 0.71 |
+| Ensemble | 2.74 | 0.63 |
+| SARIMAX | 2.86 | 0.79 |
+| XGBoost | 3.64 | 1.07 |
+| GRU | 3.81 | 1.72 |
+| Baseline | 6.01 | 2.74 |
+
+Aquí el backtest **no coincide** con el campeón del holdout único: XGBoost gana la última
+semana (2.69%), pero Chronos-2 es el más consistente a lo largo de 5 ventanas independientes
+(2.22% de media, la desviación más baja de todas). Es la razón de ser de este backtest --
+un solo holdout puede llevar a una conclusión distinta de la que sale con más ventanas. La
+selección de modelo en producción sigue el holdout único (`predict.py` no cambia de criterio
+por esto), pero queda documentado como el hallazgo honesto que es.
+
+## Intervalos de predicción (P10-P90)
+
+Además del valor puntual, se calcula un intervalo de predicción a partir de los residuos
+(real - predicho) del propio backtest, agrupados por día del horizonte (o por paso, en %
+renovable) y tomando los percentiles 10 y 90 -- mismo método para todos los modelos. La
+cobertura real (¿el intervalo nominal del 80% cubre de verdad el 80% de las observaciones?)
+se mide sin circularidad: el intervalo de cada ventana se calcula solo con las demás
+ventanas (*leave-one-fold-out*).
+
+| Objetivo | Cobertura real del campeón |
+|---|---|
+| Demanda (GRU) | 56.9% |
+| % Renovable (XGBoost) | 54.3% |
+
+Ambas quedan claramente por debajo del 80% nominal -- los intervalos salen más estrechos de
+lo que deberían. Con solo 3-5 ventanas de backtest, los percentiles 10/90 se calculan sobre
+muy pocas muestras y no son una estimación fiable de un intervalo al 80% real. Se reporta tal
+cual sale, sin ajustar el método para que cuadre con el número esperado.
 
 ![Demanda: real vs. predicción](outputs/demanda_mwh_comparativa.png)
 ![Mix de generación eléctrica por tecnología](outputs/generation_mix.png)
@@ -219,17 +309,19 @@ era preferir un número peor sin ganar nada a cambio. Se corrigió: gana el que 
 ## App interactiva (Streamlit)
 
 `app.py` tiene 4 secciones:
-- **Histórico interactivo**: demanda horaria y un mix de generación por tecnología tipo
-  *stacked-area* (el estándar visual del sector), no solo el % renovable agregado.
+- **Histórico interactivo**: mix de generación por tecnología tipo *stacked-area* (el
+  estándar visual del sector) y demanda horaria, no solo el % renovable agregado.
 - **Comparativa de modelos**: tabla completa de métricas (MAE, RMSE, MAPE, sMAPE, R²,
-  sesgo, mejora vs. baseline, MAPE día 1 vs. día 7) y gráfica interactiva real-vs-predicción
-  con los 5 modelos -- por defecto solo se muestran real, baseline y el campeón para que no
-  sature, el resto se activa con un clic en la leyenda.
+  sesgo, mejora vs. baseline, MAPE día 1 vs. día 7), gráfica interactiva real-vs-predicción
+  con banda de intervalo de predicción sobre el campeón, y un desplegable con los resultados
+  del backtest walk-forward (media ± desviación por ventana, cobertura real de los
+  intervalos).
 - **Predicción en tiempo real**: recalculada bajo demanda con la previsión de clima real de
-  los próximos 7 días (no es un stream continuo -- de ahí las comillas), con el progreso
-  visible paso a paso (qué modelo se está ejecutando y cuánto lleva tardando) en vez de un
-  spinner ciego, más un desglose por tecnología (solar/eólica/hidráulica/otras) de la
-  predicción de % renovable, independiente de cuál sea el modelo campeón del agregado.
+  los próximos 7 días, con progreso visible paso a paso. El eje siempre ancla "hoy" en la
+  misma posición (3 días reales hacia atrás + el horizonte hacia delante); para los días ya
+  pasados se reconstruye lo que habría predicho el modelo campeón con el clima real ya
+  ocurrido, para comparar predicho contra real también ahí. Incluye desglose por tecnología
+  (solar/eólica/hidráulica/otras) e intervalos de predicción P10-P90.
 - **Metodología**: las explicaciones de este README pensadas para defenderlas en una
   entrevista, no solo para leerlas.
 
@@ -244,7 +336,8 @@ streamlit run app.py
 pip install -r requirements.txt
 
 python data.py      # descarga 10 años de demanda/generación (REE) + clima (Open-Meteo)
-python train.py     # entrena y compara los modelos para los 2 objetivos
+python train.py     # entrena, compara y hace backtest walk-forward de los 2 objetivos
+                     # (varias horas: incluye búsqueda de hiperparámetros y backtest)
 python predict.py   # genera la predicción a 7 días con el modelo campeón de cada objetivo
 streamlit run app.py
 ```
@@ -257,6 +350,7 @@ train.py         # entrena y compara los modelos para los 2 objetivos, guarda m�
 predict.py        # predicción a 7 días "en vivo" con el modelo campeón de cada objetivo
 app.py             # dashboard de Streamlit
 outputs/            # métricas, gráficas y predicciones generadas por los scripts
+outputs/models/     # pesos entrenados (XGBoost, GRU) que carga predict.py
 energy_weather_hourly.csv  # dataset cacheado (se regenera con data.py)
 ```
 
@@ -295,3 +389,13 @@ El % renovable es diario porque esa es la resolución de la API pública de REE
 - El recorte de días incompletos (`trim_incomplete_trailing_days`) usa un umbral fijo de 20
   horas -- funciona bien en la práctica, pero es una heurística, no una certeza de que REE
   haya terminado de publicar ese día.
+- El backtest usa solo 3 ventanas en demanda y 5 en renovable -- menos de lo ideal, recortado
+  por tiempo de cómputo (el GRU reentrena por ventana). Suficiente para ver si el error es
+  consistente o varía mucho, pero los intervalos de predicción que salen de ahí (ver más
+  arriba) se calculan sobre pocas muestras y su cobertura real queda por debajo del 80%
+  nominal -- reportado tal cual, no ajustado a posteriori.
+- "XGBoost (descompuesto)" se queda fuera del backtest walk-forward por simplicidad -- sigue
+  evaluado en el holdout único y en el desglose por tecnología de la predicción en vivo.
+- Los modelos persistidos (XGBoost, GRU) se quedan fijos entre entrenamientos de `train.py` --
+  si el patrón de la serie cambia de forma notable entre una ejecución y la siguiente, la
+  predicción en vivo no se entera hasta que se vuelva a ejecutar `train.py`.

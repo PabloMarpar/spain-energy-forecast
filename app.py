@@ -19,7 +19,7 @@ from data import CACHE_PATH, add_calendar_features, fetch_ree_demanda, fetch_ree
 
 OUTPUT_DIR = Path("outputs")
 
-st.set_page_config(page_title="Demanda eléctrica y renovables en España", page_icon="⚡", layout="wide")
+st.set_page_config(page_title="Demanda eléctrica y renovables en España", layout="wide")
 
 # Paleta pensada para el tema oscuro de Streamlit (ver .streamlit/config.toml) --
 # "real" en blanco roto para que destaque siempre sobre el fondo oscuro, algo que
@@ -75,6 +75,17 @@ def load_cached_forecast() -> dict | None:
         return json.load(fh)
 
 
+@st.cache_resource(show_spinner=False)
+def load_chronos_pipeline():
+    """Cachea el foundation model entre clicks del botón (y entre sesiones que
+    comparten el mismo proceso) -- cargarlo desde HuggingFace tarda varios
+    segundos y no cambia de una predicción a otra, así que repetirlo en cada
+    click era puro desperdicio de CPU (justo lo que hace saltar el throttling
+    de Streamlit Community Cloud)."""
+    from chronos import Chronos2Pipeline
+    return Chronos2Pipeline.from_pretrained("amazon/chronos-2", device_map="cpu")
+
+
 @st.cache_data(ttl=1800, show_spinner=False)
 def load_recent_actuals(start_iso: str, end_iso: str) -> tuple[pd.Series, pd.Series]:
     """Demanda horaria y % renovable diario YA PUBLICADOS por REE entre `start_iso`
@@ -110,14 +121,17 @@ def _elapsed_mape(pred: pd.Series, real: pd.Series) -> float | None:
     return float((abs(actual[nonzero] - predicted[nonzero]) / abs(actual[nonzero])).mean() * 100)
 
 
+METADATA_KEYS = {"_campeon", "_campeon_backtest", "_backtest"}
+
+
 def metrics_table(target_results: dict) -> pd.DataFrame:
     champion = target_results.get("_campeon")
     rows = []
     for name, vals in target_results.items():
-        if name == "_campeon":
+        if name in METADATA_KEYS:
             continue
         rows.append({
-            "Modelo": f"{name} 🏆" if name == champion else name,
+            "Modelo": f"{name} (campeón)" if name == champion else name,
             "MAE": vals["MAE"], "RMSE": vals["RMSE"], "MAPE %": vals["MAPE_%"],
             "sMAPE %": vals["sMAPE_%"], "R²": vals["R2"], "Sesgo": vals["Bias"],
             "MAPE día 1 %": vals.get("MAPE_dia1_%"), "MAPE día 7 %": vals.get("MAPE_dia7_%"),
@@ -126,16 +140,34 @@ def metrics_table(target_results: dict) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def line_chart(x, series_dict: dict, ylabel: str, hidden: set = frozenset()) -> go.Figure:
+def _hex_to_rgba(hex_color: str, alpha: float) -> str:
+    hex_color = hex_color.lstrip("#")
+    r, g, b = int(hex_color[0:2], 16), int(hex_color[2:4], 16), int(hex_color[4:6], 16)
+    return f"rgba({r},{g},{b},{alpha})"
+
+
+def line_chart(x, series_dict: dict, ylabel: str, hidden: set = frozenset(), band: dict = None) -> go.Figure:
     """`hidden`: nombres de serie que arrancan ocultas (clic en la leyenda para
     mostrarlas) -- por defecto se muestran real + baseline + el campeón, y el
     resto queda disponible pero oculto para no saturar la gráfica de entrada.
-    El título se pinta con `chart_title` (un `st.markdown` fuera de la figura),
-    no con el `title` de Plotly -- con leyendas de varias líneas en pantallas
-    estrechas, el título interno de Plotly podía acabar solapado con la leyenda."""
+    `band`: {nombre_serie: (lower, upper)} -- pinta una banda de confianza
+    (percentiles del backtest walk-forward) alrededor de esa serie, sin añadir
+    entradas nuevas a la leyenda. El título se pinta con `chart_title` (un
+    `st.markdown` fuera de la figura), no con el `title` de Plotly -- con
+    leyendas de varias líneas en pantallas estrechas, el título interno de
+    Plotly podía acabar solapado con la leyenda."""
     fig = go.Figure()
+    band = band or {}
     for name, y in series_dict.items():
-        style = dict(color=COLORS.get(name, "#c9c9c9"), width=3 if name == "real" else 2.2)
+        color = COLORS.get(name, "#c9c9c9")
+        if name in band and band[name][0] is not None:
+            lower, upper = band[name]
+            fig.add_trace(go.Scatter(x=x, y=lower, mode="lines", line=dict(width=0),
+                                      showlegend=False, hoverinfo="skip"))
+            fig.add_trace(go.Scatter(x=x, y=upper, mode="lines", line=dict(width=0), fill="tonexty",
+                                      fillcolor=_hex_to_rgba(color, 0.15),
+                                      showlegend=False, hoverinfo="skip", name=f"{name} (P10-P90)"))
+        style = dict(color=color, width=3 if name == "real" else 2.2)
         if name in DASH:
             style["dash"] = DASH[name]
         fig.add_trace(go.Scatter(
@@ -185,7 +217,7 @@ def stacked_generation_chart(view: pd.DataFrame) -> go.Figure:
 # Cabecera
 # ---------------------------------------------------------------------------
 
-st.title("⚡ Demanda eléctrica y % renovable en España -- a 7 días vista")
+st.title("Demanda eléctrica y % renovable en España -- a 7 días vista")
 st.markdown(
     """
 Proyecto de forecasting con datos 100% reales y públicos: demanda y mix de generación de
@@ -200,7 +232,7 @@ history = load_history()
 metrics_data = load_metrics()
 
 tab_historico, tab_modelos, tab_vivo, tab_metodologia = st.tabs(
-    ["📈 Histórico", "🏁 Comparativa de modelos", "🔮 Predicción en tiempo real", "🧠 Metodología"]
+    ["Histórico", "Comparativa de modelos", "Predicción en tiempo real", "Metodología"]
 )
 
 # ---------------------------------------------------------------------------
@@ -250,18 +282,69 @@ with tab_modelos:
         st.dataframe(metrics_table(results), use_container_width=True, hide_index=True)
 
         holdout = load_holdout(target_col)
-        series_dict = {c: holdout[c] for c in holdout.columns if c != "datetime"}
+        interval_cols = {f"{champion}_lower", f"{champion}_upper"}
+        series_dict = {c: holdout[c] for c in holdout.columns if c != "datetime" and c not in interval_cols}
         non_priority = {"real", "Baseline", champion}
         hidden = {name for name in series_dict if name not in non_priority}
+        band = {}
+        if interval_cols <= set(holdout.columns):
+            band[champion] = (holdout[f"{champion}_lower"], holdout[f"{champion}_upper"])
         chart_title(f"{label}: real vs. predicción (últimos 7 días, holdout de evaluación) -- "
                     "clic en la leyenda para mostrar/ocultar modelos")
-        fig = line_chart(holdout["datetime"], series_dict, ylabel, hidden=hidden)
+        fig = line_chart(holdout["datetime"], series_dict, ylabel, hidden=hidden, band=band)
         st.plotly_chart(fig, use_container_width=True)
 
         importancia_path = OUTPUT_DIR / f"{target_col}_importancia.png"
         if importancia_path.exists():
             with st.expander("Importancia de variables (XGBoost)"):
                 st.image(str(importancia_path))
+
+        backtest = results.get("_backtest")
+        if backtest and backtest.get("agregado"):
+            with st.expander(f"Backtesting: robustez con {backtest['n_folds']} ventanas "
+                              "independientes (walk-forward)"):
+                st.caption(
+                    "Un único holdout de 7 días puede ser optimista o pesimista solo por suerte -- "
+                    "aquí se evalúan varias ventanas independientes y consecutivas, con entrenamiento "
+                    "expansivo. SARIMAX y XGBoost reutilizan el orden/hiperparámetros ya validados en "
+                    "el holdout único (repetir la búsqueda en cada ventana sería intratable en CPU); "
+                    "el GRU sí reentrena en cada ventana. \"XGBoost (descompuesto)\" queda fuera de "
+                    "este backtest por simplicidad."
+                )
+                agregado_df = pd.DataFrame([
+                    {"Modelo": name, "MAPE % (media)": vals["MAPE_%_mean"],
+                     "MAPE % (desv.)": vals["MAPE_%_std"], "MAE (media)": vals["MAE_mean"],
+                     "MAE (desv.)": vals["MAE_std"], "Ventanas OK": vals["n_folds_ok"]}
+                    for name, vals in backtest["agregado"].items()
+                ]).sort_values("MAPE % (media)")
+                st.dataframe(agregado_df, use_container_width=True, hide_index=True)
+
+                campeon_backtest = results.get("_campeon_backtest")
+                if campeon_backtest and campeon_backtest != champion:
+                    st.caption(
+                        f"El campeón del holdout único (`{champion}`) no coincide con el del backtest "
+                        f"multi-ventana (`{campeon_backtest}`) -- diferencia real entre evaluar una sola "
+                        "semana y varias. La selección de modelo en producción sigue el holdout único."
+                    )
+
+                cobertura = backtest.get("cobertura_empirica_loo_%", {})
+                cobertura_txt = ", ".join(f"{name}: {pct}%" for name, pct in cobertura.items()
+                                           if pct is not None)
+                if cobertura_txt:
+                    st.caption(
+                        "Cobertura real del intervalo de predicción (P10-P90, nominal ~80%), medida "
+                        f"sin circularidad (leave-one-fold-out): {cobertura_txt}."
+                    )
+
+                fold_rows = []
+                for f in backtest["folds"]:
+                    row = {"Ventana": f["fold"], "Test": f"{f['test_inicio'][:10]} → {f['test_fin'][:10]}"}
+                    for name in backtest["agregado"]:
+                        if name in f:
+                            row[name] = f[name]["MAPE_%"]
+                    fold_rows.append(row)
+                st.caption("MAPE % por ventana -- para ver si el error es consistente o varía mucho de una a otra.")
+                st.dataframe(pd.DataFrame(fold_rows), use_container_width=True, hide_index=True)
         st.divider()
 
     st.markdown(
@@ -300,7 +383,7 @@ punto de la gráfica y se ve de un vistazo cómo ha ido acertando la predicción
     cached = load_cached_forecast()
     col_a, col_b = st.columns([1, 3])
     with col_a:
-        refresh = st.button("🔄 Generar predicción ahora", use_container_width=True)
+        refresh = st.button("Generar predicción ahora", use_container_width=True)
 
     forecast = cached
     if refresh:
@@ -311,7 +394,13 @@ punto de la gráfica y se ve de un vistazo cómo ha ido acertando la predicción
             def _progress(msg):
                 log_box.write(f"`{time.time() - t0:5.1f}s` {msg}")
 
-            forecast = predict.build_forecast(progress=_progress)
+            chronos_pipeline = None
+            if (predict.uses_chronos(metrics_data["demanda_mwh"])
+                    or predict.uses_chronos(metrics_data["renewable_pct"])):
+                _progress("Cargando Chronos-2 (cacheado tras la primera vez en este servidor)...")
+                chronos_pipeline = load_chronos_pipeline()
+
+            forecast = predict.build_forecast(progress=_progress, chronos_pipeline=chronos_pipeline)
             with open(OUTPUT_DIR / "latest_forecast.json", "w", encoding="utf-8") as fh:
                 json.dump(forecast, fh, indent=2, ensure_ascii=False)
             load_cached_forecast.clear()
@@ -338,12 +427,10 @@ punto de la gráfica y se ve de un vistazo cómo ha ido acertando la predicción
         renovable_fut_full = pd.DataFrame(forecast["renovable_pct"])
         renovable_fut_full["date_dt"] = pd.to_datetime(renovable_fut_full["date"])
 
-        # Para los días ya pasados no hay ninguna predicción guardada de una
-        # corrida anterior -- se rellenan con el "retrospectivo" que calcula
-        # predict.py (relanza el modelo campeón con el clima real ya ocurrido
-        # desde entonces), para poder ver predicho Y real también ahí, no solo
-        # el real. Los forecasts guardados antes de que existiera este campo
-        # simplemente no lo tienen (`.get(..., [])`), y se degrada sin más.
+        # Para los días ya pasados se usa el "retrospectivo" que calcula
+        # predict.py (relanza el modelo campeón con el clima real ya ocurrido),
+        # para mostrar predicho y real también ahí. Forecasts guardados antes
+        # de este campo simplemente no lo tienen (`.get(..., [])`).
         retro_demanda = pd.DataFrame(forecast.get("retro_demanda_mwh", []))
         if not retro_demanda.empty:
             retro_demanda["datetime"] = pd.to_datetime(
@@ -360,37 +447,65 @@ punto de la gráfica y se ve de un vistazo cómo ha ido acertando la predicción
                  renovable_fut_full],
                 ignore_index=True)
 
-        # Eje anclado en "hoy": se fijan siempre 3 días hacia atrás (para ver cómo
-        # ha ido la predicción justo antes de hoy) y todo lo que quede del
-        # horizonte hacia delante -- así "hoy" cae siempre en la misma posición
-        # (el 4º día) en vez de moverse según cuándo se generó la predicción.
+        # Eje anclado en "hoy": 3 días hacia atrás más lo que quede del
+        # horizonte hacia delante, para que "hoy" caiga siempre en la misma
+        # posición sin importar cuándo se generó la predicción.
         today_date = pd.Timestamp.now(tz="Europe/Madrid").date()
         today = pd.Timestamp(today_date, tz="Europe/Madrid")
         window_start = today - pd.Timedelta(days=3)
         demanda_real, renovable_real = load_recent_actuals(str(window_start.date()), str(today_date))
-        # El % renovable de "hoy" que devuelve REE es un acumulado a medias del día
-        # todavía en curso, no el % final -- se descarta, igual que ya se hace con
-        # el histórico (`trim_incomplete_trailing_days`), para no comparar la
-        # predicción del día completo contra un real que aún no lo es.
+        # El % renovable de "hoy" que da REE es un acumulado a medias del día
+        # en curso, no el valor final -- se descarta (igual que
+        # `trim_incomplete_trailing_days` en el histórico).
         renovable_real = renovable_real[renovable_real.index < pd.Timestamp(today_date)]
 
         demanda_end = max(demanda_fut_full["datetime"].max(), today + pd.Timedelta(hours=23))
         full_hours = pd.date_range(window_start, demanda_end, freq="h")
-        demanda_pred_s = demanda_fut_full.set_index("datetime")["mwh"].reindex(full_hours)
+        demanda_indexed = demanda_fut_full.set_index("datetime")
+        demanda_pred_s = demanda_indexed["mwh"].reindex(full_hours)
         demanda_real_s = demanda_real.reindex(full_hours)
 
         renovable_end = max(renovable_fut_full["date_dt"].max(), pd.Timestamp(today_date))
         full_days = pd.date_range(window_start.tz_localize(None).normalize(), renovable_end, freq="D")
-        renovable_pred_s = renovable_fut_full.set_index("date_dt")["pct"].reindex(full_days)
+        renovable_indexed = renovable_fut_full.set_index("date_dt")
+        renovable_pred_s = renovable_indexed["pct"].reindex(full_days)
         renovable_real_s = renovable_real.reindex(full_days)
 
+        # Banda de confianza (P10-P90) del backtest walk-forward -- solo
+        # existe para el tramo hacia delante, el retrospectivo no lleva
+        # intervalo propio (ver predict.py).
+        demanda_band = {"predicción": (
+            demanda_indexed["mwh_p10"].reindex(full_hours) if "mwh_p10" in demanda_indexed.columns else None,
+            demanda_indexed["mwh_p90"].reindex(full_hours) if "mwh_p90" in demanda_indexed.columns else None,
+        )}
+        renovable_band = {"predicción": (
+            renovable_indexed["pct_p10"].reindex(full_days) if "pct_p10" in renovable_indexed.columns else None,
+            renovable_indexed["pct_p90"].reindex(full_days) if "pct_p90" in renovable_indexed.columns else None,
+        )}
+
         chart_title("Demanda eléctrica: últimos 3 días + predicción a lo que queda de horizonte")
-        fig_d = line_chart(full_hours, {"real": demanda_real_s, "predicción": demanda_pred_s}, "MWh")
+        fig_d = line_chart(full_hours, {"real": demanda_real_s, "predicción": demanda_pred_s}, "MWh",
+                            band=demanda_band)
         st.plotly_chart(fig_d, use_container_width=True)
 
         chart_title("% de generación renovable: últimos 3 días + predicción")
-        fig_r = line_chart(full_days, {"real": renovable_real_s, "predicción": renovable_pred_s}, "%")
+        fig_r = line_chart(full_days, {"real": renovable_real_s, "predicción": renovable_pred_s}, "%",
+                            band=renovable_band)
         st.plotly_chart(fig_r, use_container_width=True)
+
+        if forecast.get("intervalo_metodo"):
+            cobertura_d = (metrics_data.get("demanda_mwh", {}).get("_backtest", {})
+                           .get("cobertura_empirica_loo_%", {}).get(forecast["modelo_demanda"]))
+            cobertura_r = (metrics_data.get("renewable_pct", {}).get("_backtest", {})
+                           .get("cobertura_empirica_loo_%", {}).get(forecast["modelo_renovable"]))
+            partes = ["La banda sombreada es un intervalo de predicción (P10-P90, ~80% nominal) "
+                      "calculado a partir de los residuos del backtest walk-forward, no una previsión "
+                      "de otro modelo."]
+            if cobertura_d is not None:
+                partes.append(f"Cobertura real medida en demanda: {cobertura_d}%.")
+            if cobertura_r is not None:
+                partes.append(f"En % renovable: {cobertura_r}%.")
+            st.caption(" ".join(partes))
 
         mape_demanda = _elapsed_mape(demanda_pred_s, demanda_real_s)
         mape_renovable = _elapsed_mape(renovable_pred_s, renovable_real_s)
@@ -473,6 +588,32 @@ de series temporales en general por su preentrenamiento, generaliza mejor con me
 específicos. Por eso la app usa el campeón de cada objetivo por separado en vez de forzar un
 único modelo para todo -- y por eso, cuando promediar ayuda, el campeón es el Ensemble.
 
+### Backtesting: por qué un solo holdout no basta
+El holdout de 7 días de la pestaña "Comparativa de modelos" es una sola muestra -- si esa
+semana en concreto fue rara (una ola de calor, un puente festivo largo), el MAPE que sale
+puede ser optimista o pesimista solo por suerte, no porque el modelo sea mejor o peor de
+verdad. Por eso, además, se hace un **backtest walk-forward**: se evalúan varias ventanas de
+7 días consecutivas al final de la serie (5 en demanda, 8 en % renovable), cada una con su
+propio entrenamiento expansivo (todo lo anterior a esa ventana). SARIMAX y XGBoost reutilizan
+en cada ventana el orden/hiperparámetros ya validados en el holdout único -- repetir esa
+búsqueda en cada ventana sería intratable en CPU, y no es lo que se está midiendo aquí. El
+GRU sí reentrena y recalcula su normalización en cada ventana, porque esas estadísticas
+salen de los datos de esa ventana en concreto; reutilizar las del entrenamiento completo
+sería una fuga de información hacia el pasado. El resultado (media ± desviación del MAPE
+sobre varias ventanas) está en un desplegable bajo cada gráfica de la pestaña de
+comparativa.
+
+### Intervalos de predicción (P10-P90)
+Hasta aquí todo eran predicciones puntuales -- un único número, sin decir qué tan seguro
+está el modelo de él. La banda sombreada que aparece en las gráficas es un intervalo de
+predicción calculado a partir de los residuos (real - predicho) del propio backtest
+walk-forward: se agrupan por día del horizonte (o por paso, en % renovable) y se toman los
+percentiles 10 y 90 -- el mismo método para todos los modelos, para que sea comparable. La
+cobertura real (¿el intervalo nominal del 80% cubre de verdad ~80% de las observaciones?) se
+mide sin trampa: el intervalo de cada ventana se calcula solo con las OTRAS ventanas
+(leave-one-fold-out), nunca con sus propios datos. El número sale donde salga -- si el
+intervalo queda mal calibrado, se reporta así, no se ajusta a posteriori para que cuadre.
+
 ### Limitaciones honestas
 - El oleaje ("fuerza del mar") se probó porque España tiene generación undimotriz real, pero
   es una instalación piloto casi anecdótica en el mix nacional -- se esperaba (y se confirma
@@ -487,5 +628,12 @@ específicos. Por eso la app usa el campeón de cada objetivo por separado en ve
 - El % renovable es una serie diaria (no horaria) porque así lo publica REE en su API
   pública -- con datos horarios de generación por tecnología el modelo probablemente
   mejoraría bastante más, capturando el patrón diario de subida y bajada solar.
+- El backtest walk-forward usa solo 5-8 ventanas -- suficiente para ver si el error es
+  consistente o varía mucho, pero los percentiles de los intervalos de predicción salen de
+  relativamente pocas muestras (sobre todo en % renovable, 8 ventanas de 7 días): son
+  estimaciones útiles, no un intervalo estadísticamente muy afinado.
+- "XGBoost (descompuesto)" (la suma de 4 sub-modelos por tecnología) se queda fuera del
+  backtest walk-forward por simplicidad -- sí se sigue mostrando en la comparativa del
+  holdout único y en el desglose por tecnología de la predicción en vivo.
 """
     )

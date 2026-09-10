@@ -19,19 +19,22 @@ de clima más reciente disponible).
 """
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import torch
+import xgboost as xgb
 
 from data import (
     CACHE_PATH, add_calendar_features, fetch_weather, fetch_marine, fetch_wind_regions,
-    fetch_demand_climate, trim_incomplete_trailing_days,
+    fetch_demand_climate, fetch_ree_demanda, trim_incomplete_trailing_days,
 )
 from train import (
-    OUTPUT_DIR, sarimax_auto_forecast, xgb_direct_forecast, gru_direct_forecast,
-    chronos_covariate_forecast, baseline_seasonal, SUB_RENEWABLE_TARGETS,
+    OUTPUT_DIR, MODEL_DIR, sarimax_auto_forecast, xgb_direct_forecast, xgb_direct_predict_only,
+    gru_direct_forecast, gru_direct_predict_only, chronos_covariate_forecast, baseline_seasonal,
+    SUB_RENEWABLE_TARGETS,
 )
 
 DEMAND_FEATURES = ["temperature_2m", "relative_humidity_2m", "shortwave_radiation",
@@ -50,9 +53,36 @@ RENEWABLE_FEATURES = ["shortwave_radiation", "shortwave_radiation_max", "direct_
                        "wind_speed_100m", "wind_speed_100m_max",
                        "wind_national_mean_100m", "wind_national_max_100m", "wind_national_std_100m",
                        "wind_power_proxy", "wind_power_proxy_max", "precipitation",
+                       "precip_cum_30d", "precip_cum_90d",
                        "surface_pressure", "doy_sin", "doy_cos",
-                       "is_weekend", "is_holiday"]
+                       "is_weekend", "is_holiday", "demanda_diaria_mwh"]
 RENEWABLE_SARIMAX_DEFAULTS = (7, None)
+
+
+def apply_interval(point_pred: pd.Series, model_name: str, target_results: dict, bucket_size: int):
+    """Intervalo empírico (P10-P90) del backtest walk-forward aplicado a una
+    predicción puntual en vivo -- mismo bucketing que train.py, sobre el
+    índice posicional del horizonte (h=1..len), no sobre la fecha. Si el
+    modelo servido en vivo no tiene un intervalo propio en el backtest (p.ej.
+    un "Ensemble parcial" por fallo de un componente en vivo), se cae al
+    intervalo de "Ensemble" si existe; si tampoco, no hay banda -- se marca
+    `approx=True` para que la app pueda avisarlo en vez de mostrar algo
+    engañosamente preciso."""
+    backtest = target_results.get("_backtest", {})
+    intervalos = backtest.get("intervalos_empiricos", {})
+    interval_for = intervalos.get(model_name) or intervalos.get("Ensemble")
+    if not interval_for:
+        return None, None, True
+    approx = model_name not in intervalos
+    lower, upper = [], []
+    for h in range(len(point_pred)):
+        bucket = interval_for.get(f"bucket_{h // bucket_size}")
+        if bucket is None:
+            bucket = {"p10": 0.0, "p90": 0.0}
+            approx = True
+        lower.append(point_pred.iloc[h] + bucket["p10"])
+        upper.append(point_pred.iloc[h] + bucket["p90"])
+    return (pd.Series(lower, index=point_pred.index), pd.Series(upper, index=point_pred.index), approx)
 
 
 def load_target_results() -> tuple[dict, dict]:
@@ -113,27 +143,32 @@ def fetch_retro_weather(start, end) -> pd.DataFrame:
 
 
 def build_retro_forecast(history: pd.DataFrame, demand_results: dict, renewable_results: dict,
-                          chronos_pipeline, retro_days: int = 3, progress=None) -> dict:
+                          chronos_pipeline, retro_days: int = 7, progress=None) -> dict:
     """Relanza el modelo campeón como si "hoy" fuera hace `retro_days` días,
-    alimentándolo con el clima que de verdad ocurrió desde entonces (no una
-    previsión) -- reutilizando siempre los mismos hiperparámetros/orden ya
-    validados, igual que la predicción hacia delante. Sirve para poder
-    enseñar en la app predicho Y real en los días recién pasados, no solo el
-    real -- sin esto, para esos días no hay ninguna predicción guardada de
-    ninguna corrida anterior."""
+    con el clima real de esos días (no una previsión), para poder mostrar en
+    la app predicho y real también en los días recién pasados.
+
+    `retro_days=7`, no 3 (lo único que la app pinta): el GRU reutiliza
+    `stats_normalizacion` del horizonte de entrenamiento original (168h en
+    demanda, 7 días en renovable), y un horizonte más corto aquí no cuadraría
+    con esas estadísticas. Termina en ayer, no hoy, por el mismo motivo -- el
+    bloque cubre exactamente 168h/7 días. La app recorta al *reindex* lo que
+    no necesita (ver `window_start` en app.py)."""
     def _p(msg):
         if progress:
             progress(msg)
 
     empty = {"demanda_mwh": [], "renovable_pct": []}
     today = pd.Timestamp.now(tz="Europe/Madrid").normalize()
+    retro_end = (today - pd.Timedelta(days=1)).date()
     retro_start = (today - pd.Timedelta(days=retro_days)).date()
-    if retro_start >= today.date():
+    if retro_start > retro_end:
         return empty
 
-    _p(f"Reconstruyendo qué habría predicho el modelo desde el {retro_start} (clima real, no previsto)...")
+    _p(f"Reconstruyendo qué habría predicho el modelo entre el {retro_start} y el {retro_end} "
+       "(clima real, no previsto)...")
     try:
-        retro_hourly = fetch_retro_weather(retro_start, today.date())
+        retro_hourly = fetch_retro_weather(retro_start, retro_end)
     except Exception as exc:
         print(f"No se pudo traer el clima real de los últimos {retro_days} días ({exc}), se omite el retro.")
         return empty
@@ -146,6 +181,21 @@ def build_retro_forecast(history: pd.DataFrame, demand_results: dict, renewable_
 
     history_daily_retro = aggregate_daily_history(history_retro)
     retro_daily = aggregate_daily(retro_hourly)
+    # demanda_diaria_mwh usa aquí la demanda real ya publicada por REE, no la
+    # predicción retrospectiva de arriba -- el resto del retrospectivo también
+    # usa datos ya conocidos (clima real, no previsión).
+    try:
+        # +1 día: `end` en fetch_ree_demanda solo añade la hora 00:00 de ese
+        # día, no el día completo.
+        demanda_real_retro = fetch_ree_demanda(retro_start, retro_end + timedelta(days=1))
+        retro_daily["demanda_diaria_mwh"] = retro_daily["datetime"].dt.date.map(
+            demanda_real_retro.groupby(demanda_real_retro["datetime"].dt.date)["demanda_mwh"].sum())
+    except Exception as exc:
+        print(f"No se pudo traer la demanda real de los últimos {retro_days} días ({exc}), "
+              "se usa la predicción retrospectiva de demanda como aproximación.")
+        retro_daily["demanda_diaria_mwh"] = retro_daily["datetime"].dt.date.map(
+            demand_pred_retro.groupby(demand_pred_retro.index.date).sum())
+    _inject_precip_cum(history_daily_retro, retro_daily)
     if renewable_results["_campeon"] == "XGBoost (descompuesto)":
         tech_breakdown_retro = forecast_technology_breakdown(
             history_daily_retro, retro_daily, renewable_results, _p)
@@ -163,6 +213,51 @@ def build_retro_forecast(history: pd.DataFrame, demand_results: dict, renewable_
         "renovable_pct": [{"date": str(t.date() if hasattr(t, "date") else t), "pct": round(float(v), 1)}
                            for t, v in renewable_pred_retro.items()],
     }
+
+
+def _xgb_predict(target_col: str, horizon: int, lag_steps: list, roll_windows: list, feature_cols: list,
+                  combined: pd.DataFrame, origin_stride: int, fixed_params: dict,
+                  model_path: Path = None) -> pd.Series:
+    """Si hay un modelo XGBoost ya entrenado guardado en disco (por train.py),
+    se carga y se hace solo inferencia -- sin reconstruir el frame histórico
+    completo ni reajustar. Si no existe el fichero o falla la carga (p.ej. un
+    metrics.json más nuevo con variables que ese modelo no vio), se cae a
+    reentrenar en vivo con los hiperparámetros ya validados, igual que antes."""
+    model_path = model_path or MODEL_DIR / f"{target_col}_xgb.json"
+    if model_path.exists():
+        try:
+            model = xgb.XGBRegressor()
+            model.load_model(str(model_path))
+            return xgb_direct_predict_only(combined, target_col, horizon, lag_steps, roll_windows,
+                                            feature_cols, model)
+        except Exception as exc:
+            print(f"No se pudo usar el XGBoost persistido de {target_col} ({exc}), se reentrena en vivo.")
+    pred, *_ = xgb_direct_forecast(combined, target_col, horizon, lag_steps, roll_windows,
+                                    feature_cols, origin_stride, fixed_params=fixed_params)
+    return pred
+
+
+def _gru_predict(target_col: str, horizon: int, feature_cols: list, window: int, combined: pd.DataFrame,
+                  origin_stride: int, fixed_stats: dict, model_path: Path = None) -> pd.Series:
+    """Mismo patrón que `_xgb_predict` pero para el GRU: si hay pesos ya
+    entrenados en disco Y las estadísticas de normalización que les
+    corresponden, se carga y se hace solo un forward pass. Si no, se reentrena
+    en vivo (más lento, pero sigue funcionando -- degradación segura)."""
+    model_path = model_path or MODEL_DIR / f"{target_col}_gru.pt"
+    if fixed_stats and model_path.exists():
+        try:
+            state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
+            return gru_direct_predict_only(combined, target_col, feature_cols, window, horizon,
+                                            fixed_stats, state_dict)
+        except Exception as exc:
+            print(f"No se pudo usar el GRU persistido de {target_col} ({exc}), se reentrena en vivo.")
+            # fixed_stats puede ser precisamente la causa del fallo (p.ej. no
+            # coincide con el número de variables actual) -- reentrenar con
+            # esas mismas stats repetiría el mismo error. Se recalculan de cero.
+            fixed_stats = None
+    pred, *_ = gru_direct_forecast(combined, target_col, horizon, feature_cols, window,
+                                    origin_stride=origin_stride, fixed_stats=fixed_stats)
+    return pred
 
 
 def _forecast_one_model(name: str, combined: pd.DataFrame, target_col: str, horizon: int,
@@ -184,16 +279,15 @@ def _forecast_one_model(name: str, combined: pd.DataFrame, target_col: str, hori
     if name == "XGBoost":
         info = target_results.get("XGBoost", {})
         origin_stride = DEMAND_ORIGIN_STRIDE if target_col == "demanda_mwh" else 1
-        pred, *_ = xgb_direct_forecast(combined, target_col, horizon, lag_steps, roll_windows,
-                                        feature_cols, origin_stride,
-                                        fixed_params=info.get("mejores_hiperparametros"))
+        pred = _xgb_predict(target_col, horizon, lag_steps, roll_windows, feature_cols, combined,
+                             origin_stride, info.get("mejores_hiperparametros"))
         return pred
     if name == "GRU":
         info = target_results.get("GRU", {})
         window = DEMAND_GRU_WINDOW if target_col == "demanda_mwh" else RENEWABLE_GRU_WINDOW
         origin_stride = DEMAND_ORIGIN_STRIDE if target_col == "demanda_mwh" else 1
-        pred, *_ = gru_direct_forecast(combined, target_col, horizon, feature_cols, window,
-                                        origin_stride=origin_stride, fixed_stats=info.get("stats_normalizacion"))
+        pred = _gru_predict(target_col, horizon, feature_cols, window, combined, origin_stride,
+                             info.get("stats_normalizacion"))
         return pred
     if name == "Chronos-2":
         pred = chronos_covariate_forecast(train_series_full, train_feat, fut_feat, horizon, chronos_pipeline)
@@ -322,7 +416,24 @@ def aggregate_daily_history(history: pd.DataFrame) -> pd.DataFrame:
     daily["eolica_pct"] = daily["tech_eolica_pct"]
     daily["hidraulica_pct"] = daily["tech_hidraulica_pct"]
     daily["otras_pct"] = daily["tech_otras_renovables_pct"] + daily["tech_residuos_renovables_pct"]
+    demanda_por_dia = history.groupby(history["datetime"].dt.date)["demanda_mwh"].sum()
+    daily["demanda_diaria_mwh"] = daily["datetime"].dt.date.map(demanda_por_dia)
     return daily
+
+
+def _inject_precip_cum(history_daily: pd.DataFrame, future_daily: pd.DataFrame) -> None:
+    """Añade precip_cum_30d/90d a `history_daily` y `future_daily` (in-place),
+    calculadas sobre la serie combinada -- el tramo futuro necesita también la
+    lluvia de antes de sí mismo para su propia ventana de 30/90 días."""
+    combined = pd.concat(
+        [history_daily["precipitation"], future_daily["precipitation"]], ignore_index=True)
+    cum30 = combined.shift(1).rolling(30).sum().fillna(0)
+    cum90 = combined.shift(1).rolling(90).sum().fillna(0)
+    n = len(history_daily)
+    history_daily["precip_cum_30d"] = cum30.iloc[:n].to_numpy()
+    history_daily["precip_cum_90d"] = cum90.iloc[:n].to_numpy()
+    future_daily["precip_cum_30d"] = cum30.iloc[n:].to_numpy()
+    future_daily["precip_cum_90d"] = cum90.iloc[n:].to_numpy()
 
 
 def forecast_technology_breakdown(history_daily: pd.DataFrame, future_daily: pd.DataFrame,
@@ -346,16 +457,32 @@ def forecast_technology_breakdown(history_daily: pd.DataFrame, future_daily: pd.
             [history_daily[["datetime", sub_target] + RENEWABLE_FEATURES], future_part], ignore_index=True
         )
         fixed_params = sub_info.get(sub_target, {}).get("mejores_hiperparametros")
-        pred, *_ = xgb_direct_forecast(combined, sub_target, horizon, lag_steps, roll_windows,
-                                        RENEWABLE_FEATURES, origin_stride=1, fixed_params=fixed_params)
+        model_path = MODEL_DIR / f"descompuesto_{sub_target}_xgb.json"
+        pred = _xgb_predict(sub_target, horizon, lag_steps, roll_windows, RENEWABLE_FEATURES,
+                             combined, origin_stride=1, fixed_params=fixed_params, model_path=model_path)
         breakdown[sub_target] = pred
     return breakdown
 
 
-def build_forecast(progress=None) -> dict:
+def uses_chronos(target_results: dict) -> bool:
+    champ = target_results["_campeon"]
+    if champ == "Chronos-2":
+        return True
+    if champ == "Ensemble":
+        return "Chronos-2" in target_results.get("Ensemble", {}).get("compuesto_por", [])
+    return False
+
+
+def build_forecast(progress=None, chronos_pipeline=None) -> dict:
     """`progress`, si se pasa, es una función que recibe un string describiendo
     el paso en curso -- así la app de Streamlit puede mostrar al usuario en qué
-    punto va la predicción "en tiempo real" en vez de un spinner ciego."""
+    punto va la predicción "en tiempo real" en vez de un spinner ciego.
+
+    `chronos_pipeline`: si se pasa ya cargado (la app lo cachea con
+    `st.cache_resource` entre clicks del botón, ver app.py), se reutiliza tal
+    cual -- cargar el foundation model desde HuggingFace tarda varios segundos
+    y no cambia entre predicciones, así que repetirlo en cada click era puro
+    desperdicio. Si no se pasa, se carga aquí (comportamiento anterior)."""
     def _p(msg):
         if progress:
             progress(msg)
@@ -368,16 +495,7 @@ def build_forecast(progress=None) -> dict:
     _p("Consultando previsión meteorológica real de los próximos 7 días (Open-Meteo)...")
     future_hourly = fetch_future_weather(horizon_days=7)
 
-    def _uses_chronos(target_results: dict) -> bool:
-        champ = target_results["_campeon"]
-        if champ == "Chronos-2":
-            return True
-        if champ == "Ensemble":
-            return "Chronos-2" in target_results.get("Ensemble", {}).get("compuesto_por", [])
-        return False
-
-    chronos_pipeline = None
-    if _uses_chronos(demand_results) or _uses_chronos(renewable_results):
+    if chronos_pipeline is None and (uses_chronos(demand_results) or uses_chronos(renewable_results)):
         _p("Cargando Chronos-2 (foundation model)...")
         from chronos import Chronos2Pipeline
         chronos_pipeline = Chronos2Pipeline.from_pretrained("amazon/chronos-2", device_map="cpu")
@@ -385,14 +503,19 @@ def build_forecast(progress=None) -> dict:
     demand_pred, demand_model_used = forecast_demand(history, future_hourly, demand_results, chronos_pipeline, _p)
 
     try:
-        retro = build_retro_forecast(history, demand_results, renewable_results, chronos_pipeline,
-                                      retro_days=3, progress=_p)
+        retro = build_retro_forecast(history, demand_results, renewable_results, chronos_pipeline, progress=_p)
     except Exception as exc:
         _p(f"No se pudo reconstruir el retrospectivo de los últimos días ({exc}), se omite.")
         retro = {"demanda_mwh": [], "renovable_pct": []}
 
     history_daily = aggregate_daily_history(history)
     future_daily = aggregate_daily(future_hourly)
+    # demanda_diaria_mwh y precip_cum_30d/90d son covariables del % renovable
+    # (ver RENEWABLE_FEATURES). Para el tramo futuro no hay demanda real
+    # todavía, se usa la predicción de demanda ya calculada arriba.
+    future_daily["demanda_diaria_mwh"] = future_daily["datetime"].dt.date.map(
+        demand_pred.groupby(demand_pred.index.date).sum())
+    _inject_precip_cum(history_daily, future_daily)
     tech_breakdown = forecast_technology_breakdown(history_daily, future_daily, renewable_results, _p)
     if renewable_results["_campeon"] == "XGBoost (descompuesto)":
         # El campeón ES la suma de las 4 piezas -- no se recalcula un modelo
@@ -420,14 +543,31 @@ def build_forecast(progress=None) -> dict:
             "renovable_gwh": round(gwh * pct / 100, 1) if gwh == gwh and pct == pct else None,
         })
 
+    _p("Calculando intervalos de predicción (percentiles del backtest walk-forward)...")
+    demand_lower, demand_upper, demand_approx = apply_interval(demand_pred, demand_model_used, demand_results, 24)
+    renewable_lower, renewable_upper, renewable_approx = apply_interval(
+        renewable_pred, renewable_model_used, renewable_results, 1)
+
     result = {
         "generado_en": datetime.now(timezone.utc).isoformat(),
         "historico_hasta": str(history["datetime"].max().date()),
         "modelo_demanda": demand_model_used,
         "modelo_renovable": renewable_model_used,
-        "demanda_mwh": [{"datetime": str(t), "mwh": round(float(v), 1)} for t, v in demand_pred.items()],
-        "renovable_pct": [{"date": str(t.date() if hasattr(t, "date") else t), "pct": round(float(v), 1)}
-                           for t, v in renewable_pred.items()],
+        "intervalo_metodo": "percentiles empíricos (P10-P90) de los residuos del backtest walk-forward",
+        "intervalo_aproximado_demanda": demand_approx,
+        "intervalo_aproximado_renovable": renewable_approx,
+        "demanda_mwh": [
+            {"datetime": str(t), "mwh": round(float(v), 1),
+             "mwh_p10": round(float(demand_lower.iloc[i]), 1) if demand_lower is not None else None,
+             "mwh_p90": round(float(demand_upper.iloc[i]), 1) if demand_upper is not None else None}
+            for i, (t, v) in enumerate(demand_pred.items())
+        ],
+        "renovable_pct": [
+            {"date": str(t.date() if hasattr(t, "date") else t), "pct": round(float(v), 1),
+             "pct_p10": round(float(renewable_lower.iloc[i]), 1) if renewable_lower is not None else None,
+             "pct_p90": round(float(renewable_upper.iloc[i]), 1) if renewable_upper is not None else None}
+            for i, (t, v) in enumerate(renewable_pred.items())
+        ],
         "retro_demanda_mwh": retro["demanda_mwh"],
         "retro_renovable_pct": retro["renovable_pct"],
         "resumen_diario": daily_summary,

@@ -33,7 +33,19 @@ from data import CACHE_PATH, add_calendar_features
 
 OUTPUT_DIR = Path("outputs")
 OUTPUT_DIR.mkdir(exist_ok=True)
+MODEL_DIR = OUTPUT_DIR / "models"
+MODEL_DIR.mkdir(exist_ok=True)
 optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+# Backtesting walk-forward: en vez de fiarse de un único holdout de 7 días
+# (¿y si esa semana en concreto fue rara?), se evalúan varias ventanas
+# independientes y consecutivas al final de la serie, con entrenamiento
+# expansivo. SARIMAX/XGBoost reutilizan su orden/hiperparámetros ya validados
+# (cero coste extra de búsqueda), pero el GRU sí reentrena por fold -- ese es
+# el coste real a limitar, y con qué acotar el tiempo total de entrenamiento
+# a algo razonable (se midió ~150s por cada 5 épocas de GRU en demanda).
+N_FOLDS_DEMAND = 3
+N_FOLDS_RENEWABLE = 5
 
 COLORS = {"Real": "#0b0b0b", "Baseline": "#898781", "SARIMAX": "#eb6834",
           "XGBoost": "#2a78d6", "GRU": "#d62839", "Chronos-2": "#1baf7a", "Ensemble": "#8e44ad"}
@@ -260,6 +272,27 @@ def xgb_direct_forecast(df: pd.DataFrame, target_col: str, horizon: int, lag_ste
     return pd.Series(preds, index=index), model, feature_names, best_params
 
 
+def xgb_direct_predict_only(df: pd.DataFrame, target_col: str, horizon: int, lag_steps: list,
+                             roll_windows: list, feature_cols: list, model: xgb.XGBRegressor) -> pd.Series:
+    """Inferencia pura con un XGBoost YA ENTRENADO (cargado desde disco) -- sin
+    construir el frame histórico completo ni volver a ajustar el modelo. Es lo
+    que usa predict.py en producción en vez de `xgb_direct_forecast`."""
+    train_df = df.iloc[:-horizon].reset_index(drop=True)
+    base = _lag_roll_features(train_df[target_col], lag_steps, roll_windows).iloc[-1].to_dict()
+    future_meta = df.iloc[-horizon:].reset_index(drop=True)
+    feature_names = list(base.keys()) + ["h"] + feature_cols
+    rows = []
+    for h in range(1, horizon + 1):
+        row = dict(base)
+        row["h"] = h
+        for col in feature_cols:
+            row[col] = future_meta[col].iloc[h - 1]
+        rows.append(row)
+    preds = model.predict(pd.DataFrame(rows)[feature_names])
+    index = df.iloc[-horizon:].set_index("datetime").index
+    return pd.Series(preds, index=index)
+
+
 # ---------------------------------------------------------------------------
 # GRU directo multi-horizonte (PyTorch) -- el "clásico" de deep learning que
 # faltaba en la comparativa (estadístico, árboles, foundation model, y ahora
@@ -279,10 +312,12 @@ def xgb_direct_forecast(df: pd.DataFrame, target_col: str, horizon: int, lag_ste
 # salga, ganar o no ganar no es el objetivo aquí.
 
 class DirectGRU(nn.Module):
-    def __init__(self, n_past_features: int, n_future_features: int, horizon: int, hidden_size: int = 64):
+    def __init__(self, n_past_features: int, n_future_features: int, horizon: int, hidden_size: int = 64,
+                 dropout: float = 0.0):
         super().__init__()
         self.encoder = nn.GRU(input_size=n_past_features, hidden_size=hidden_size, batch_first=True)
         self.future_proj = nn.Linear(n_future_features, hidden_size)
+        self.dropout = nn.Dropout(dropout)
         self.head = nn.Sequential(
             nn.Linear(hidden_size * 2, hidden_size), nn.ReLU(), nn.Linear(hidden_size, horizon)
         )
@@ -291,7 +326,7 @@ class DirectGRU(nn.Module):
         _, h_n = self.encoder(past_seq)
         h = h_n.squeeze(0)
         f = torch.relu(self.future_proj(future_feats))
-        return self.head(torch.cat([h, f], dim=1))
+        return self.head(self.dropout(torch.cat([h, f], dim=1)))
 
 
 def _standardize(values: np.ndarray, mean: np.ndarray = None, std: np.ndarray = None):
@@ -328,35 +363,13 @@ def build_sequence_dataset(df: pd.DataFrame, target_col: str, past_feature_cols:
     return X_past, X_future, Y
 
 
-def gru_direct_forecast(df: pd.DataFrame, target_col: str, horizon: int, feature_cols: list,
-                         window: int, origin_stride: int, hidden_size: int = 64,
-                         epochs: int = 30, lr: float = 1e-3, fixed_stats: dict = None):
-    """Si se pasa `fixed_stats` (medias/desviaciones ya calculadas por un
-    entrenamiento previo) se usan directamente para normalizar en vez de
-    recalcularlas -- mismo patrón que `fixed_params` en XGBoost: predict.py
-    reentrena un GRU fresco cada vez (es rápido, unos segundos en CPU), pero
-    con la normalización ya validada, no una nueva de cada tirada."""
-    torch.manual_seed(42)
-    past_feature_cols = [target_col] + feature_cols
-    train_df = df.iloc[:-horizon].reset_index(drop=True)
-    X_past, X_future, Y = build_sequence_dataset(train_df, target_col, past_feature_cols,
-                                                  feature_cols, window, horizon, origin_stride)
-
-    if fixed_stats:
-        past_mean, past_std = np.array(fixed_stats["past_mean"]), np.array(fixed_stats["past_std"])
-        future_mean, future_std = np.array(fixed_stats["future_mean"]), np.array(fixed_stats["future_std"])
-        y_mean, y_std = fixed_stats["y_mean"], fixed_stats["y_std"]
-        X_past_n = (X_past - past_mean) / past_std
-        X_future_n = (X_future - future_mean) / future_std
-        Y_n = (Y - y_mean) / y_std
-    else:
-        X_past_n, past_mean, past_std = _standardize(X_past.reshape(-1, X_past.shape[-1]))
-        X_past_n = X_past_n.reshape(X_past.shape)
-        X_future_n, future_mean, future_std = _standardize(X_future)
-        y_mean, y_std = Y.mean(), Y.std() or 1.0
-        Y_n = (Y - y_mean) / y_std
-
-    model = DirectGRU(len(past_feature_cols), X_future.shape[1], horizon, hidden_size)
+def _train_gru(X_past_n: np.ndarray, X_future_n: np.ndarray, Y_n: np.ndarray, n_past_features: int,
+               n_future_features: int, horizon: int, hidden_size: int, dropout: float,
+               epochs: int, lr: float) -> nn.Module:
+    """Bucle de entrenamiento del GRU, separado de `gru_direct_forecast` para
+    poder reutilizarlo tal cual desde `tune_gru_params_direct` (cada prueba de
+    Optuna entrena una red desde cero) sin duplicar el código."""
+    model = DirectGRU(n_past_features, n_future_features, horizon, hidden_size, dropout)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     loss_fn = nn.MSELoss()
     past_t = torch.tensor(X_past_n, dtype=torch.float32)
@@ -377,6 +390,97 @@ def gru_direct_forecast(df: pd.DataFrame, target_col: str, horizon: int, feature
             loss = loss_fn(pred, y_t[idx])
             loss.backward()
             opt.step()
+    return model
+
+
+def tune_gru_params_direct(df: pd.DataFrame, target_col: str, feature_cols: list, window: int,
+                            horizon: int, origin_stride: int, n_trials: int = 4) -> dict:
+    """Búsqueda de hiperparámetros del GRU con Optuna (tamaño oculto, dropout,
+    learning rate, épocas), igual que `tune_xgb_params_direct` para XGBoost.
+    Validación por ORIGEN, no por fila (una fila de un origen comparte ventana
+    pasada con las demás). Menos pruebas que XGBoost (4 vs. 40): cada prueba
+    entrena una red desde cero y es mucho más cara por prueba."""
+    torch.manual_seed(42)
+    past_feature_cols = [target_col] + feature_cols
+    train_df = df.iloc[:-horizon].reset_index(drop=True)
+    X_past, X_future, Y = build_sequence_dataset(train_df, target_col, past_feature_cols,
+                                                  feature_cols, window, horizon, origin_stride)
+    n = len(X_past)
+    n_val = max(int(n * 0.15), 3)
+    tr, val = slice(0, n - n_val), slice(n - n_val, n)
+
+    def objective(trial):
+        hidden_size = trial.suggest_categorical("hidden_size", [32, 64, 96, 128])
+        dropout = trial.suggest_float("dropout", 0.0, 0.3)
+        lr = trial.suggest_float("lr", 1e-4, 5e-3, log=True)
+        epochs = trial.suggest_int("epochs", 15, 30, step=5)
+
+        X_past_n, past_mean, past_std = _standardize(X_past[tr].reshape(-1, X_past.shape[-1]))
+        X_past_n = X_past_n.reshape(X_past[tr].shape)
+        X_future_n, future_mean, future_std = _standardize(X_future[tr])
+        y_mean, y_std = Y[tr].mean(), Y[tr].std() or 1.0
+        Y_n = (Y[tr] - y_mean) / y_std
+
+        model = _train_gru(X_past_n, X_future_n, Y_n, len(past_feature_cols), X_future.shape[1],
+                            horizon, hidden_size, dropout, epochs, lr)
+
+        X_past_val_n = (X_past[val] - past_mean) / past_std
+        X_future_val_n = (X_future[val] - future_mean) / future_std
+        model.eval()
+        with torch.no_grad():
+            pred_n = model(torch.tensor(X_past_val_n, dtype=torch.float32),
+                            torch.tensor(X_future_val_n, dtype=torch.float32))
+        pred = pred_n.numpy() * y_std + y_mean
+        return float(np.sqrt(np.mean((Y[val] - pred) ** 2)))
+
+    study = optuna.create_study(direction="minimize", sampler=optuna.samplers.TPESampler(seed=42))
+    # Se incluyen los valores por defecto de siempre como una prueba más --
+    # con solo 4 pruebas, Optuna puede no encontrar nada mejor (se comprobó:
+    # el MAPE de demanda empeoró de 3.27% a 4.79%). Así, en el peor caso,
+    # `best_params` es exactamente lo que ya funcionaba.
+    study.enqueue_trial({"hidden_size": 64, "dropout": 0.0, "lr": 1e-3, "epochs": 30})
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+    return study.best_params
+
+
+def gru_direct_forecast(df: pd.DataFrame, target_col: str, horizon: int, feature_cols: list,
+                         window: int, origin_stride: int, hidden_size: int = 64, dropout: float = 0.0,
+                         epochs: int = 30, lr: float = 1e-3, fixed_stats: dict = None,
+                         tune: bool = False, n_trials: int = 4):
+    """Si se pasa `fixed_stats` (medias/desviaciones ya calculadas por un
+    entrenamiento previo) se usan directamente para normalizar en vez de
+    recalcularlas -- mismo patrón que `fixed_params` en XGBoost. Si `tune=True`
+    (solo en train.py; predict.py nunca lo activa) se busca antes
+    hidden_size/dropout/lr/epochs con `tune_gru_params_direct` en vez de usar
+    los valores por defecto sin comprobar. Los pesos entrenados se devuelven en
+    `model` -- `main()` los persiste a disco para que predict.py pueda cargarlos
+    en vez de reentrenar en cada predicción en vivo (ver `gru_direct_predict_only`)."""
+    torch.manual_seed(42)
+    past_feature_cols = [target_col] + feature_cols
+    train_df = df.iloc[:-horizon].reset_index(drop=True)
+    X_past, X_future, Y = build_sequence_dataset(train_df, target_col, past_feature_cols,
+                                                  feature_cols, window, horizon, origin_stride)
+
+    if tune:
+        best = tune_gru_params_direct(df, target_col, feature_cols, window, horizon, origin_stride, n_trials)
+        hidden_size, dropout, lr, epochs = best["hidden_size"], best["dropout"], best["lr"], best["epochs"]
+
+    if fixed_stats:
+        past_mean, past_std = np.array(fixed_stats["past_mean"]), np.array(fixed_stats["past_std"])
+        future_mean, future_std = np.array(fixed_stats["future_mean"]), np.array(fixed_stats["future_std"])
+        y_mean, y_std = fixed_stats["y_mean"], fixed_stats["y_std"]
+        X_past_n = (X_past - past_mean) / past_std
+        X_future_n = (X_future - future_mean) / future_std
+        Y_n = (Y - y_mean) / y_std
+    else:
+        X_past_n, past_mean, past_std = _standardize(X_past.reshape(-1, X_past.shape[-1]))
+        X_past_n = X_past_n.reshape(X_past.shape)
+        X_future_n, future_mean, future_std = _standardize(X_future)
+        y_mean, y_std = Y.mean(), Y.std() or 1.0
+        Y_n = (Y - y_mean) / y_std
+
+    model = _train_gru(X_past_n, X_future_n, Y_n, len(past_feature_cols), X_future.shape[1],
+                        horizon, hidden_size, dropout, epochs, lr)
 
     # Predicción real: un único origen (el final de train_df, con datos 100%
     # reales) -- igual que en el resto de modelos directos.
@@ -396,8 +500,39 @@ def gru_direct_forecast(df: pd.DataFrame, target_col: str, horizon: int, feature
     stats = {"past_mean": past_mean.tolist(), "past_std": past_std.tolist(),
              "future_mean": future_mean.tolist(), "future_std": future_std.tolist(),
              "y_mean": float(y_mean), "y_std": float(y_std),
-             "window": window, "hidden_size": hidden_size, "epochs": epochs}
+             "window": window, "hidden_size": hidden_size, "dropout": dropout, "epochs": epochs}
     return pd.Series(preds, index=index), model, past_feature_cols, stats
+
+
+def gru_direct_predict_only(df: pd.DataFrame, target_col: str, feature_cols: list, window: int,
+                             horizon: int, fixed_stats: dict, state_dict: dict) -> pd.Series:
+    """Forward pass con un GRU ya entrenado (pesos cargados desde disco), sin
+    reentrenar. Usado por predict.py en producción en vez de
+    `gru_direct_forecast`."""
+    past_feature_cols = [target_col] + feature_cols
+    n_future_features = horizon * len(feature_cols)
+    model = DirectGRU(len(past_feature_cols), n_future_features, horizon,
+                       fixed_stats.get("hidden_size", 64), fixed_stats.get("dropout", 0.0))
+    model.load_state_dict(state_dict)
+    model.eval()
+
+    past_mean, past_std = np.array(fixed_stats["past_mean"]), np.array(fixed_stats["past_std"])
+    future_mean, future_std = np.array(fixed_stats["future_mean"]), np.array(fixed_stats["future_std"])
+    y_mean, y_std = fixed_stats["y_mean"], fixed_stats["y_std"]
+
+    last_past = df[past_feature_cols].iloc[-horizon - window:-horizon].values.astype(float)
+    last_future = df[feature_cols].iloc[-horizon:].values.astype(float).reshape(1, -1)
+    if np.isnan(last_past).any() or np.isnan(last_future).any():
+        raise ValueError("NaN en la ventana de predicción del GRU (revisa las columnas de feature_cols)")
+    last_past_n = ((last_past - past_mean) / past_std)[None, ...]
+    last_future_n = (last_future - future_mean) / future_std
+
+    with torch.no_grad():
+        pred_n = model(torch.tensor(last_past_n, dtype=torch.float32),
+                        torch.tensor(last_future_n, dtype=torch.float32))
+    preds = pred_n.numpy().reshape(-1) * y_std + y_mean
+    index = df.iloc[-horizon:].set_index("datetime").index
+    return pd.Series(preds, index=index)
 
 
 # ---------------------------------------------------------------------------
@@ -542,6 +677,9 @@ def run_decomposed_renewable(daily: pd.DataFrame, feature_cols: list, lag_steps:
         sub_models[sub_target] = {"mejores_hiperparametros": params}
         combined_pred = pred if combined_pred is None else combined_pred.add(pred, fill_value=0)
         print(f"  -- {sub_target}: MAE {metrics(sub_actual, pred)['MAE']}")
+        # Igual que el XGBoost principal: se persiste para que predict.py
+        # (forecast_technology_breakdown) haga solo inferencia.
+        model.save_model(str(MODEL_DIR / f"descompuesto_{sub_target}_xgb.json"))
 
     result = metrics(actual_holdout, combined_pred)
     result.update(horizon_breakdown(actual_holdout.values, combined_pred.values, near_far_split))
@@ -602,10 +740,13 @@ def run_comparison(df: pd.DataFrame, target_col: str, horizon: int, baseline_sea
     results["XGBoost"]["mejora_vs_baseline_%"] = round(
         (baseline_mape - results["XGBoost"]["MAPE_%"]) / baseline_mape * 100, 1)
     print("XGBoost (Optuna):", results["XGBoost"])
+    # Se persiste el modelo entrenado -- predict.py lo carga en vez de
+    # reentrenar en cada predicción en vivo (ver xgb_direct_predict_only).
+    xgb_model.save_model(str(MODEL_DIR / f"{target_col}_xgb.json"))
 
     try:
         gru_pred, gru_model, gru_features, gru_stats = gru_direct_forecast(
-            data_, target_col, horizon, feature_cols, gru_window, origin_stride
+            data_, target_col, horizon, feature_cols, gru_window, origin_stride, tune=True
         )
         forecasts["GRU"] = gru_pred.values
         results["GRU"] = metrics(actual_holdout, gru_pred)
@@ -613,7 +754,11 @@ def run_comparison(df: pd.DataFrame, target_col: str, horizon: int, baseline_sea
         results["GRU"]["stats_normalizacion"] = gru_stats
         results["GRU"]["mejora_vs_baseline_%"] = round(
             (baseline_mape - results["GRU"]["MAPE_%"]) / baseline_mape * 100, 1)
-        print("GRU (PyTorch, directo):", {k: v for k, v in results["GRU"].items() if k != "stats_normalizacion"})
+        print("GRU (PyTorch, directo, Optuna):",
+              {k: v for k, v in results["GRU"].items() if k != "stats_normalizacion"})
+        # Igual que XGBoost: se persisten los pesos para que predict.py haga
+        # solo inferencia (forward pass) en vez de repetir el entrenamiento.
+        torch.save(gru_model.state_dict(), MODEL_DIR / f"{target_col}_gru.pt")
     except Exception as exc:
         print(f"GRU falló ({exc}), se omite de la comparativa.")
 
@@ -668,6 +813,202 @@ def run_comparison(df: pd.DataFrame, target_col: str, horizon: int, baseline_sea
     return results
 
 
+# ---------------------------------------------------------------------------
+# Backtesting walk-forward + intervalos de predicción empíricos
+# ---------------------------------------------------------------------------
+
+def make_fold_cuts(n_points: int, horizon: int, n_folds: int, min_train: int) -> list:
+    """Índices de corte para folds no solapados y consecutivos al final de la
+    serie (ventana de entrenamiento expansiva: el fold i entrena con todo lo
+    anterior a `cuts[i]`). Si no hay margen para `n_folds` completos dado
+    `min_train`, se reduce `n_folds` en vez de fallar o construir folds con
+    apenas entrenamiento -- con la escala real de este proyecto (87.580 filas
+    horarias, ~3.650 días) esto nunca llega a activarse, pero evita que el
+    backtest se rompa silenciosamente si el histórico se acorta en el futuro."""
+    max_folds = (n_points - min_train) // horizon
+    n_folds = max(0, min(n_folds, max_folds))
+    if n_folds == 0:
+        return []
+    start = n_points - horizon * n_folds
+    return [start + horizon * i for i in range(n_folds)]
+
+
+def compute_empirical_intervals(residuals: dict, horizon: int, bucket_size: int) -> dict:
+    """Percentiles 10/90 de los residuos (real - predicho) del backtest,
+    agrupados por cubeta de paso del horizonte (bucket = paso // bucket_size)
+    y juntando todos los folds -- con solo 5-8 folds, un percentil POR PASO
+    sería demasiado ruidoso; agrupar en cubetas (24h para demanda, 1 día para
+    renovables) da más muestras por estimación a cambio de menos resolución."""
+    out = {}
+    n_buckets = int(np.ceil(horizon / bucket_size))
+    for name, arrs in residuals.items():
+        if not arrs:
+            continue
+        arr = np.stack(arrs)  # (n_folds, horizon)
+        buckets = {}
+        for b in range(n_buckets):
+            lo, hi = b * bucket_size, min((b + 1) * bucket_size, horizon)
+            flat = arr[:, lo:hi].reshape(-1)
+            buckets[f"bucket_{b}"] = {"p10": round(float(np.percentile(flat, 10)), 3),
+                                       "p90": round(float(np.percentile(flat, 90)), 3)}
+        out[name] = buckets
+    return out
+
+
+def loo_interval_coverage(residuals: dict, horizon: int, bucket_size: int) -> dict:
+    """Cobertura real del intervalo empírico (nominal ~80%, P10-P90), medida
+    SIN circularidad: el intervalo usado para evaluar el fold i se calcula solo
+    con los DEMÁS folds (leave-one-fold-out), nunca con sus propios residuos.
+    Se reporta tal cual salga -- por encima o por debajo del 80% nominal, no
+    se ajusta a posteriori para que "cuadre"."""
+    out = {}
+    n_buckets = int(np.ceil(horizon / bucket_size))
+    for name, arrs in residuals.items():
+        n_folds = len(arrs)
+        if n_folds < 2:
+            continue
+        arr = np.stack(arrs)
+        covered = total = 0
+        for i in range(n_folds):
+            others = np.delete(arr, i, axis=0)
+            for b in range(n_buckets):
+                lo, hi = b * bucket_size, min((b + 1) * bucket_size, horizon)
+                other_flat = others[:, lo:hi].reshape(-1)
+                if len(other_flat) == 0:
+                    continue
+                p10, p90 = np.percentile(other_flat, [10, 90])
+                held_out = arr[i, lo:hi]
+                covered += int(((held_out >= p10) & (held_out <= p90)).sum())
+                total += len(held_out)
+        out[name] = round(covered / total * 100, 1) if total else None
+    return out
+
+
+def run_backtest(df: pd.DataFrame, target_col: str, horizon: int, n_folds: int,
+                  baseline_season_len: int, lag_steps: list, roll_windows: list, feature_cols: list,
+                  chronos_pipeline, sarimax_period: int, sarimax_fixed_order, sarimax_fixed_seasonal_order,
+                  sarimax_max_train, xgb_fixed_params: dict, origin_stride: int, gru_window: int,
+                  min_train: int, bucket_size: int) -> dict:
+    """Backtest walk-forward: evalúa `n_folds` ventanas independientes y
+    consecutivas al final de la serie, con entrenamiento expansivo, en vez de
+    un único holdout de `horizon` puntos. SARIMAX y XGBoost reutilizan el
+    orden/hiperparámetros ya validados en el holdout único -- repetir la
+    búsqueda en cada fold sería intratable en CPU. El GRU sí reentrena y
+    recalcula su normalización por fold (reutilizar las del entrenamiento
+    completo filtraría datos futuros al fold). No incluye "XGBoost
+    (descompuesto)" -- fuera de alcance, ver limitaciones en el README."""
+    data_ = df.dropna(subset=[target_col] + feature_cols).reset_index(drop=True)
+    cuts = make_fold_cuts(len(data_), horizon, n_folds, min_train)
+    empty = {"n_folds": 0, "horizon": horizon, "bucket_size": bucket_size,
+             "folds": [], "agregado": {}, "intervalos_empiricos": {}, "cobertura_empirica_loo_%": {}}
+    if not cuts:
+        print(f"  aviso: sin margen para backtest de {target_col} (n={len(data_)}, horizon={horizon})")
+        return empty
+
+    fold_records, residuals = [], {}
+    for i, cut in enumerate(cuts):
+        window_df = data_.iloc[:cut + horizon].reset_index(drop=True)
+        series = window_df.set_index("datetime")[target_col]
+        exog = window_df.set_index("datetime")[feature_cols]
+        actual = series.iloc[-horizon:]
+
+        preds = {"Baseline": baseline_seasonal(series, horizon, baseline_season_len).values}
+
+        if sarimax_fixed_order and sarimax_fixed_seasonal_order:
+            try:
+                sarimax_pred, _ = sarimax_auto_forecast(
+                    series, exog, horizon, sarimax_period, sarimax_max_train,
+                    False, tuple(sarimax_fixed_order), tuple(sarimax_fixed_seasonal_order))
+                preds["SARIMAX"] = sarimax_pred.values
+            except Exception as exc:
+                print(f"  fold {i} ({target_col}): SARIMAX falló ({exc})")
+
+        try:
+            xgb_pred, *_ = xgb_direct_forecast(window_df, target_col, horizon, lag_steps, roll_windows,
+                                                feature_cols, origin_stride, fixed_params=xgb_fixed_params)
+            preds["XGBoost"] = xgb_pred.values
+        except Exception as exc:
+            print(f"  fold {i} ({target_col}): XGBoost falló ({exc})")
+
+        try:
+            # epochs=20 (no el default de 30): cada fold reentrena desde cero,
+            # y con 3-5 folds ese coste se multiplica -- se prioriza acotar el
+            # tiempo total del backtest sobre exprimir el último punto de cada
+            # ventana individual.
+            gru_pred, *_ = gru_direct_forecast(window_df, target_col, horizon, feature_cols,
+                                                gru_window, origin_stride, epochs=20)
+            preds["GRU"] = gru_pred.values
+        except Exception as exc:
+            print(f"  fold {i} ({target_col}): GRU falló ({exc})")
+
+        try:
+            train_feat = window_df.iloc[:-horizon][["datetime"] + feature_cols]
+            fut_feat = window_df.iloc[-horizon:][["datetime"] + feature_cols]
+            chronos_pred = chronos_covariate_forecast(series.iloc[:-horizon], train_feat, fut_feat,
+                                                        horizon, chronos_pipeline)
+            preds["Chronos-2"] = np.asarray(chronos_pred)
+        except Exception as exc:
+            print(f"  fold {i} ({target_col}): Chronos-2 falló ({exc})")
+
+        non_baseline = {k: v for k, v in preds.items() if k != "Baseline"}
+        if len(non_baseline) >= 2:
+            preds["Ensemble"] = np.mean([np.asarray(v)[:horizon] for v in non_baseline.values()], axis=0)
+
+        fold_metrics = {}
+        for name, pred in preds.items():
+            pred = np.asarray(pred)[:horizon]
+            fold_metrics[name] = metrics(actual.values, pred)
+            residuals.setdefault(name, []).append(actual.values - pred)
+        fold_records.append({"fold": i, "test_inicio": str(actual.index[0]),
+                              "test_fin": str(actual.index[-1]), **fold_metrics})
+        mape_key = "MAPE_%"
+        mape_summary = ", ".join(f"{name}: {vals[mape_key]}" for name, vals in fold_metrics.items())
+        print(f"  fold {i} ({target_col}, {actual.index[0]}..{actual.index[-1]}): {{{mape_summary}}}")
+
+    agregado = {}
+    for name in residuals:
+        mapes = [f[name]["MAPE_%"] for f in fold_records if name in f]
+        maes = [f[name]["MAE"] for f in fold_records if name in f]
+        agregado[name] = {
+            "MAPE_%_mean": round(float(np.mean(mapes)), 2),
+            "MAPE_%_std": round(float(np.std(mapes, ddof=1)), 2) if len(mapes) > 1 else 0.0,
+            "MAE_mean": round(float(np.mean(maes)), 2),
+            "MAE_std": round(float(np.std(maes, ddof=1)), 2) if len(maes) > 1 else 0.0,
+            "n_folds_ok": len(mapes),
+        }
+
+    return {
+        "n_folds": len(cuts), "horizon": horizon, "bucket_size": bucket_size,
+        "folds": fold_records, "agregado": agregado,
+        "intervalos_empiricos": compute_empirical_intervals(residuals, horizon, bucket_size),
+        "cobertura_empirica_loo_%": loo_interval_coverage(residuals, horizon, bucket_size),
+    }
+
+
+def add_holdout_interval_columns(target_col: str, champion: str, backtest: dict) -> None:
+    """Añade columnas `{campeon}_lower`/`{campeon}_upper` al CSV de holdout que
+    ya guarda `run_comparison`, aplicando el intervalo empírico bucketed del
+    backtest a la predicción puntual ya guardada del campeón -- la app puede
+    así pintar una banda de confianza sobre el mismo gráfico de holdout que ya
+    existe, sin recalcular nada."""
+    intervalos = backtest.get("intervalos_empiricos", {}).get(champion)
+    if not intervalos:
+        return
+    path = OUTPUT_DIR / f"{target_col}_predicciones_holdout.csv"
+    holdout_df = pd.read_csv(path)
+    if champion not in holdout_df.columns:
+        return
+    bucket_size = backtest["bucket_size"]
+    lower, upper = [], []
+    for h in range(len(holdout_df)):
+        interval = intervalos.get(f"bucket_{h // bucket_size}", {"p10": 0.0, "p90": 0.0})
+        lower.append(holdout_df[champion].iloc[h] + interval["p10"])
+        upper.append(holdout_df[champion].iloc[h] + interval["p90"])
+    holdout_df[f"{champion}_lower"] = lower
+    holdout_df[f"{champion}_upper"] = upper
+    holdout_df.to_csv(path, index=False)
+
+
 def main():
     df = pd.read_csv(CACHE_PATH, parse_dates=["datetime"])
     df["datetime"] = pd.to_datetime(df["datetime"], utc=True).dt.tz_convert("Europe/Madrid")
@@ -712,11 +1053,34 @@ def main():
         near_far_split=24, origin_stride=24, gru_window=24 * 14,
         sarimax_max_train=24 * 120, sarimax_auto_search=False,
         sarimax_fixed_order=(2, 0, 2), sarimax_fixed_seasonal_order=(1, 0, 1, 24),
+        xgb_trials=15,
     )
 
+    print("\n-- Backtest walk-forward: demanda (5 ventanas de 7 días, entrenamiento expansivo) --")
+    demand_backtest = run_backtest(
+        df, "demanda_mwh", horizon=24 * 7, n_folds=N_FOLDS_DEMAND,
+        baseline_season_len=24 * 7, lag_steps=[24, 48, 168, 336], roll_windows=[24, 168],
+        feature_cols=demand_features, chronos_pipeline=chronos_pipeline,
+        sarimax_period=24, sarimax_max_train=24 * 120,
+        sarimax_fixed_order=all_results["demanda_mwh"].get("SARIMAX", {}).get("orden_pdq"),
+        sarimax_fixed_seasonal_order=all_results["demanda_mwh"].get("SARIMAX", {}).get("orden_estacional"),
+        xgb_fixed_params=all_results["demanda_mwh"]["XGBoost"]["mejores_hiperparametros"],
+        origin_stride=24, gru_window=24 * 14, min_train=24 * 400, bucket_size=24,
+    )
+    all_results["demanda_mwh"]["_backtest"] = demand_backtest
+    if demand_backtest["agregado"]:
+        all_results["demanda_mwh"]["_campeon_backtest"] = min(
+            demand_backtest["agregado"], key=lambda m: demand_backtest["agregado"][m]["MAPE_%_mean"])
+        add_holdout_interval_columns("demanda_mwh", all_results["demanda_mwh"]["_campeon"], demand_backtest)
+
+    # demanda_diaria_mwh como covariable del % renovable: por el orden de
+    # mérito del mercado eléctrico, un día de mucha demanda añade más térmica
+    # de respaldo, diluyendo el % renovable aunque la generación renovable en
+    # bruto sea la misma.
     daily = (
         df.groupby(df["datetime"].dt.date)
         .agg(renewable_pct=("renewable_pct", "first"),
+             demanda_diaria_mwh=("demanda_mwh", "sum"),
              tech_solar_fv_pct=("tech_solar_fv_pct", "first"),
              tech_solar_termica_pct=("tech_solar_termica_pct", "first"),
              tech_eolica_pct=("tech_eolica_pct", "first"),
@@ -750,6 +1114,14 @@ def main():
     daily["eolica_pct"] = daily["tech_eolica_pct"]
     daily["hidraulica_pct"] = daily["tech_hidraulica_pct"]
     daily["otras_pct"] = daily["tech_otras_renovables_pct"] + daily["tech_residuos_renovables_pct"]
+    # Lluvia acumulada de 30/90 días -- proxy del nivel de los embalses (la
+    # hidráulica depende de meses de lluvia, no del día anterior). shift(1)
+    # antes del rolling: solo lluvia previa al día que se predice, igual que
+    # en `_lag_roll_features`. Los primeros 90 días quedan sin ventana
+    # completa; se rellenan a 0 en vez de descartarse (el filtro de `lag_365`
+    # ya excluye el primer año de todos modos).
+    daily["precip_cum_30d"] = daily["precipitation"].shift(1).rolling(30).sum().fillna(0)
+    daily["precip_cum_90d"] = daily["precipitation"].shift(1).rolling(90).sum().fillna(0)
     # doy_sin/doy_cos (ciclo anual) son, con diferencia, las variables que más
     # deberían pesar aquí: el % solar depende sobre todo de en qué época del año
     # estamos, mucho más estable año a año que la meteorología día a día -- con
@@ -767,8 +1139,9 @@ def main():
                            "wind_speed_100m", "wind_speed_100m_max",
                            "wind_national_mean_100m", "wind_national_max_100m", "wind_national_std_100m",
                            "wind_power_proxy", "wind_power_proxy_max", "precipitation",
+                           "precip_cum_30d", "precip_cum_90d",
                            "surface_pressure", "doy_sin", "doy_cos",
-                           "is_weekend", "is_holiday"]
+                           "is_weekend", "is_holiday", "demanda_diaria_mwh"]
     roll_windows_renewable = [7, 30] if len(daily) > 400 else [7]
     lag_steps_renewable = [1, 7, 14, 30, 365] if len(daily) > 400 else [1, 7, 14]
     all_results["renewable_pct"] = run_comparison(
@@ -777,12 +1150,13 @@ def main():
         feature_cols=renewable_features,
         chronos_pipeline=chronos_pipeline, label="% Generación renovable", ylabel="%",
         near_far_split=1, origin_stride=1, gru_window=60, sarimax_period=7,
+        xgb_trials=15,
     )
 
     print("\n-- Experimento: % renovable descompuesto por tecnología (solar+eólica+hidráulica+otras) --")
     decomposed_result, decomposed_pred = run_decomposed_renewable(
         daily, renewable_features, lag_steps_renewable, roll_windows_renewable,
-        horizon=7, origin_stride=1, near_far_split=1,
+        horizon=7, origin_stride=1, near_far_split=1, xgb_trials=10,
     )
     baseline_mape = all_results["renewable_pct"]["Baseline"]["MAPE_%"]
     decomposed_result["mejora_vs_baseline_%"] = round(
@@ -808,6 +1182,25 @@ def main():
     holdout_df = pd.read_csv(holdout_path)
     holdout_df["XGBoost (descompuesto)"] = decomposed_pred.values[: len(holdout_df)]
     holdout_df.to_csv(holdout_path, index=False)
+
+    print("\n-- Backtest walk-forward: % renovable (8 ventanas de 7 días, entrenamiento expansivo) --")
+    renewable_backtest = run_backtest(
+        daily, "renewable_pct", horizon=7, n_folds=N_FOLDS_RENEWABLE,
+        baseline_season_len=7, lag_steps=lag_steps_renewable, roll_windows=roll_windows_renewable,
+        feature_cols=renewable_features, chronos_pipeline=chronos_pipeline,
+        sarimax_period=7, sarimax_max_train=None,
+        sarimax_fixed_order=all_results["renewable_pct"].get("SARIMAX", {}).get("orden_pdq"),
+        sarimax_fixed_seasonal_order=all_results["renewable_pct"].get("SARIMAX", {}).get("orden_estacional"),
+        xgb_fixed_params=all_results["renewable_pct"]["XGBoost"]["mejores_hiperparametros"],
+        origin_stride=1, gru_window=60, min_train=400, bucket_size=1,
+    )
+    # "XGBoost (descompuesto)" se queda fuera del backtest (ver docstring de
+    # run_backtest) -- limitación explícita, no un olvido.
+    all_results["renewable_pct"]["_backtest"] = renewable_backtest
+    if renewable_backtest["agregado"]:
+        all_results["renewable_pct"]["_campeon_backtest"] = min(
+            renewable_backtest["agregado"], key=lambda m: renewable_backtest["agregado"][m]["MAPE_%_mean"])
+        add_holdout_interval_columns("renewable_pct", champion, renewable_backtest)
 
     with open(OUTPUT_DIR / "metrics.json", "w") as fh:
         json.dump(all_results, fh, indent=2, ensure_ascii=False)
